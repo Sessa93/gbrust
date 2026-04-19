@@ -833,22 +833,17 @@ impl Arm7Tdmi {
             0b001 => self.thumb_imm_op(instr),
             0b010 => {
                 if instr & (1 << 12) != 0 {
-                    // Load/store with immediate offset (format 9)
-                    self.thumb_load_store_imm(instr, bus)
-                } else if instr & (1 << 11) != 0 {
-                    // PC-relative load (format 6)
-                    self.thumb_pc_relative_load(instr, bus)
-                } else if (instr >> 10) & 1 == 0 {
-                    if (instr >> 9) & 1 == 0 {
-                        // ALU operations (format 4)
-                        self.thumb_alu(instr)
-                    } else {
-                        // Hi register operations (format 5)
-                        self.thumb_hi_reg(instr, bus)
-                    }
-                } else {
-                    // Load/store with register offset (format 7/8)
+                    // Formats 7/8: Load/store with register offset (0101xxxx)
                     self.thumb_load_store_reg(instr, bus)
+                } else if instr & (1 << 11) != 0 {
+                    // Format 6: PC-relative load (01001xxx)
+                    self.thumb_pc_relative_load(instr, bus)
+                } else if instr & (1 << 10) != 0 {
+                    // Format 5: Hi register operations / BX (010001xx)
+                    self.thumb_hi_reg(instr, bus)
+                } else {
+                    // Format 4: ALU operations (010000xx)
+                    self.thumb_alu(instr)
                 }
             }
             0b011 => self.thumb_load_store_imm(instr, bus),
@@ -1182,21 +1177,34 @@ impl Arm7Tdmi {
     }
 
     fn thumb_load_store_reg(&mut self, instr: u32, bus: &mut impl Arm7Bus) -> u32 {
-        let op = (instr >> 10) & 3;
         let ro = ((instr >> 6) & 7) as usize;
         let rb = ((instr >> 3) & 7) as usize;
         let rd = (instr & 7) as usize;
         let addr = self.regs[rb].wrapping_add(self.regs[ro]);
 
-        match op {
-            0 => bus.write32(addr & !3, self.regs[rd]),      // STR
-            1 => bus.write8(addr, self.regs[rd] as u8),      // STRB
-            2 => self.regs[rd] = bus.read32(addr & !3),       // LDR
-            3 => self.regs[rd] = bus.read8(addr) as u32,      // LDRB
-            _ => unreachable!(),
+        if instr & (1 << 9) == 0 {
+            // Format 7: STR/STRB/LDR/LDRB
+            let op = (instr >> 10) & 3;
+            match op {
+                0 => bus.write32(addr & !3, self.regs[rd]),      // STR
+                1 => bus.write8(addr, self.regs[rd] as u8),      // STRB
+                2 => self.regs[rd] = bus.read32(addr & !3),       // LDR
+                3 => self.regs[rd] = bus.read8(addr) as u32,      // LDRB
+                _ => unreachable!(),
+            }
+            if op >= 2 { 3 } else { 2 }
+        } else {
+            // Format 8: STRH/LDSB/LDRH/LDSH
+            let op = (instr >> 10) & 3;
+            match op {
+                0 => bus.write16(addr & !1, self.regs[rd] as u16),                    // STRH
+                1 => self.regs[rd] = bus.read8(addr) as i8 as i32 as u32,             // LDSB
+                2 => self.regs[rd] = bus.read16(addr & !1) as u32,                    // LDRH
+                3 => self.regs[rd] = bus.read16(addr & !1) as i16 as i32 as u32,      // LDSH
+                _ => unreachable!(),
+            }
+            if op >= 1 { 3 } else { 2 }
         }
-
-        if op >= 2 { 3 } else { 2 }
     }
 
     fn thumb_load_store_imm(&mut self, instr: u32, bus: &mut impl Arm7Bus) -> u32 {
