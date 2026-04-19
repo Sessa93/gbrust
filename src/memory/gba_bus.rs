@@ -1,0 +1,347 @@
+use serde::{Deserialize, Serialize};
+
+use crate::apu::gba_apu::GbaApu;
+use crate::cartridge::GbaCartridge;
+use crate::cpu::arm7tdmi::Arm7Bus;
+use crate::dma::GbaDma;
+use crate::input::GbaInput;
+use crate::ppu::gba_ppu::GbaPpu;
+use crate::timer::GbaTimers;
+
+pub const BIOS_SIZE: usize = 0x4000;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GbaBus {
+    pub cart: GbaCartridge,
+    pub ppu: GbaPpu,
+    pub apu: GbaApu,
+    pub timers: GbaTimers,
+    pub dma: GbaDma,
+    pub input: GbaInput,
+    pub ewram: Vec<u8>,     // 256KB external work RAM
+    pub iwram: Vec<u8>,     // 32KB internal work RAM
+    pub io: Vec<u8>,        // IO registers
+    pub ie: u16,
+    pub iflag: u16,
+    pub ime: bool,
+    pub waitcnt: u16,
+    pub halt: bool,
+    pub post_boot: bool,
+    pub bios: Vec<u8>,
+    pub last_bios_value: u32,
+}
+
+impl GbaBus {
+    pub fn new(cart: GbaCartridge) -> Self {
+        Self {
+            cart,
+            ppu: GbaPpu::new(),
+            apu: GbaApu::new(),
+            timers: GbaTimers::new(),
+            dma: GbaDma::new(),
+            input: GbaInput::new(),
+            ewram: vec![0; 0x40000],
+            iwram: vec![0; 0x8000],
+            io: vec![0; 0x400],
+            ie: 0,
+            iflag: 0,
+            ime: false,
+            waitcnt: 0,
+            halt: false,
+            post_boot: true,
+            bios: Self::generate_hle_bios(),
+            last_bios_value: 0,
+        }
+    }
+
+    fn generate_hle_bios() -> Vec<u8> {
+        let mut bios = vec![0u8; BIOS_SIZE];
+        // Jump to cartridge
+        // MOV R15, #0x08000000
+        let instr: u32 = 0xE3A0_F302; // MOV PC, #0x08000000
+        bios[0..4].copy_from_slice(&instr.to_le_bytes());
+        // SWI handler at 0x08 - return from SWI
+        let movs: u32 = 0xE1B0_F00E; // MOVS PC, LR
+        bios[0x08..0x0C].copy_from_slice(&movs.to_le_bytes());
+        // IRQ handler at 0x18
+        bios[0x18..0x1C].copy_from_slice(&movs.to_le_bytes());
+        bios
+    }
+
+    pub fn tick(&mut self, cycles: u32) {
+        let ppu_irqs = self.ppu.tick(cycles);
+        self.iflag |= ppu_irqs;
+
+        let timer_irqs = self.timers.tick(cycles);
+        self.iflag |= timer_irqs;
+
+        self.apu.tick(cycles);
+
+        // Process DMA
+        self.process_dma();
+    }
+
+    fn process_dma(&mut self) {
+        for ch in 0..4 {
+            if !self.dma.channels[ch].active {
+                continue;
+            }
+            let count = self.dma.channels[ch].count as u32;
+            if count == 0 {
+                continue;
+            }
+
+            let word_size = if self.dma.channels[ch].word_size { 4u32 } else { 2 };
+            let src_inc: i32 = match self.dma.channels[ch].src_control {
+                0 => word_size as i32,
+                1 => -(word_size as i32),
+                2 => 0,
+                _ => word_size as i32,
+            };
+            let dst_inc: i32 = match self.dma.channels[ch].dst_control {
+                0 | 3 => word_size as i32,
+                1 => -(word_size as i32),
+                2 => 0,
+                _ => word_size as i32,
+            };
+
+            let mut src = self.dma.channels[ch].src_addr;
+            let mut dst = self.dma.channels[ch].dst_addr;
+
+            for _ in 0..count {
+                if word_size == 4 {
+                    let val = self.read32_dma(src);
+                    self.write32_dma(dst, val);
+                } else {
+                    let val = self.read16_dma(src);
+                    self.write16_dma(dst, val);
+                }
+                src = (src as i64 + src_inc as i64) as u32;
+                dst = (dst as i64 + dst_inc as i64) as u32;
+            }
+
+            self.dma.channels[ch].src_addr = src;
+            if self.dma.channels[ch].dst_control != 3 {
+                self.dma.channels[ch].dst_addr = dst;
+            }
+
+            if self.dma.channels[ch].repeat && self.dma.channels[ch].timing != 0 {
+                self.dma.channels[ch].active = true;
+            } else {
+                self.dma.channels[ch].active = false;
+                self.dma.channels[ch].enabled = false;
+            }
+
+            if self.dma.channels[ch].irq {
+                self.iflag |= 1 << (8 + ch);
+            }
+        }
+    }
+
+    fn read16_dma(&self, addr: u32) -> u16 {
+        self.read16(addr)
+    }
+
+    fn read32_dma(&self, addr: u32) -> u32 {
+        self.read32(addr)
+    }
+
+    fn write16_dma(&mut self, addr: u32, val: u16) {
+        self.write16(addr, val);
+    }
+
+    fn write32_dma(&mut self, addr: u32, val: u32) {
+        self.write32(addr, val);
+    }
+
+    pub fn check_irq(&self) -> bool {
+        self.ime && (self.ie & self.iflag) != 0
+    }
+
+    fn read_io_reg(&self, offset: u32) -> u8 {
+        let off = offset as usize;
+        match offset {
+            // Display
+            0x000..=0x001 => self.ppu.read_io(0x0400_0000 + offset) as u8,
+            0x002..=0x003 => {
+                // DISPSTAT
+                let v = self.ppu.read_dispstat();
+                if off & 1 == 0 { v as u8 } else { (v >> 8) as u8 }
+            }
+            0x004..=0x005 => {
+                let v = self.ppu.read_dispstat();
+                if off & 1 == 0 { v as u8 } else { (v >> 8) as u8 }
+            }
+            0x006..=0x007 => {
+                let v = self.ppu.vcount;
+                if off & 1 == 0 { v as u8 } else { 0 }
+            }
+            0x008..=0x05F => self.ppu.read_io(0x0400_0000 + offset) as u8,
+
+            // Sound
+            0x060..=0x0A7 => self.apu.read_io(offset),
+
+            // DMA
+            0x0B0..=0x0DF => self.dma.read(offset),
+
+            // Timers
+            0x100..=0x10F => self.timers.read(offset),
+
+            // Serial (stub)
+            0x120..=0x12F => 0,
+
+            // Keypad
+            0x130 => self.input.read_keyinput() as u8,
+            0x131 => (self.input.read_keyinput() >> 8) as u8,
+            0x132 => self.input.keycnt as u8,
+            0x133 => (self.input.keycnt >> 8) as u8,
+
+            // Interrupt control
+            0x200 => self.ie as u8,
+            0x201 => (self.ie >> 8) as u8,
+            0x202 => self.iflag as u8,
+            0x203 => (self.iflag >> 8) as u8,
+            0x204 => self.waitcnt as u8,
+            0x205 => (self.waitcnt >> 8) as u8,
+            0x208 => self.ime as u8,
+            0x209 => 0,
+
+            // Post-boot flag
+            0x300 => self.post_boot as u8,
+
+            _ => {
+                if off < self.io.len() { self.io[off] } else { 0 }
+            }
+        }
+    }
+
+    fn write_io_reg(&mut self, offset: u32, val: u8) {
+        let off = offset as usize;
+        if off < self.io.len() {
+            self.io[off] = val;
+        }
+
+        match offset {
+            // Display
+            0x000..=0x001 | 0x008..=0x05F => {
+                self.ppu.write_io(0x0400_0000 + offset, val);
+            }
+            0x002..=0x003 => self.ppu.write_dispstat(offset & 1, val),
+            0x004..=0x005 => self.ppu.write_dispstat(offset & 1, val),
+
+            // Sound
+            0x060..=0x0A7 => self.apu.write_io(offset, val),
+
+            // DMA
+            0x0B0..=0x0DF => self.dma.write(offset, val),
+
+            // Timers
+            0x100..=0x10F => self.timers.write(offset, val),
+
+            // Keypad
+            0x132 => self.input.keycnt = (self.input.keycnt & 0xFF00) | val as u16,
+            0x133 => self.input.keycnt = (self.input.keycnt & 0x00FF) | ((val as u16) << 8),
+
+            // Interrupt control
+            0x200 => self.ie = (self.ie & 0xFF00) | val as u16,
+            0x201 => self.ie = (self.ie & 0x00FF) | ((val as u16) << 8),
+            0x202 => self.iflag &= !val as u16,
+            0x203 => self.iflag &= !((val as u16) << 8),
+            0x204 => self.waitcnt = (self.waitcnt & 0xFF00) | val as u16,
+            0x205 => self.waitcnt = (self.waitcnt & 0x00FF) | ((val as u16) << 8),
+            0x208 => self.ime = val & 1 != 0,
+            0x209 => {}
+
+            // HALTCNT
+            0x301 => {
+                self.halt = true;
+            }
+
+            // Post-boot
+            0x300 => self.post_boot = val & 1 != 0,
+
+            _ => {}
+        }
+    }
+}
+
+impl Arm7Bus for GbaBus {
+    fn read8(&self, addr: u32) -> u8 {
+        match addr >> 24 {
+            0x00 => {
+                // BIOS
+                if (addr as usize) < self.bios.len() {
+                    self.bios[addr as usize]
+                } else {
+                    0
+                }
+            }
+            0x02 => self.ewram[(addr & 0x3FFFF) as usize],
+            0x03 => self.iwram[(addr & 0x7FFF) as usize],
+            0x04 => self.read_io_reg(addr & 0x3FF),
+            0x05 => self.ppu.palette[(addr & 0x3FF) as usize],
+            0x06 => {
+                let offset = (addr & 0x1FFFF) as usize;
+                let offset = if offset >= 0x18000 { offset - 0x8000 } else { offset };
+                self.ppu.vram[offset]
+            }
+            0x07 => self.ppu.oam[(addr & 0x3FF) as usize],
+            0x08..=0x0D => self.cart.read_rom(addr),
+            0x0E..=0x0F => self.cart.read_sram(addr),
+            _ => 0,
+        }
+    }
+
+    fn read16(&self, addr: u32) -> u16 {
+        let lo = self.read8(addr) as u16;
+        let hi = self.read8(addr.wrapping_add(1)) as u16;
+        lo | (hi << 8)
+    }
+
+    fn read32(&self, addr: u32) -> u32 {
+        let b0 = self.read8(addr) as u32;
+        let b1 = self.read8(addr.wrapping_add(1)) as u32;
+        let b2 = self.read8(addr.wrapping_add(2)) as u32;
+        let b3 = self.read8(addr.wrapping_add(3)) as u32;
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
+    fn write8(&mut self, addr: u32, val: u8) {
+        match addr >> 24 {
+            0x02 => self.ewram[(addr & 0x3FFFF) as usize] = val,
+            0x03 => self.iwram[(addr & 0x7FFF) as usize] = val,
+            0x04 => self.write_io_reg(addr & 0x3FF, val),
+            0x05 => {
+                // Palette - 8-bit writes duplicate to both bytes of halfword
+                let aligned = (addr & 0x3FE) as usize;
+                self.ppu.palette[aligned] = val;
+                self.ppu.palette[aligned + 1] = val;
+            }
+            0x06 => {
+                // VRAM - 8-bit writes duplicate to both bytes
+                let offset = (addr & 0x1FFFF) as usize;
+                let offset = if offset >= 0x18000 { offset - 0x8000 } else { offset };
+                let aligned = offset & !1;
+                if aligned + 1 < self.ppu.vram.len() {
+                    self.ppu.vram[aligned] = val;
+                    self.ppu.vram[aligned + 1] = val;
+                }
+            }
+            0x07 => {} // OAM ignores 8-bit writes
+            0x0E..=0x0F => self.cart.write_sram(addr, val),
+            _ => {}
+        }
+    }
+
+    fn write16(&mut self, addr: u32, val: u16) {
+        self.write8(addr, val as u8);
+        self.write8(addr.wrapping_add(1), (val >> 8) as u8);
+    }
+
+    fn write32(&mut self, addr: u32, val: u32) {
+        self.write8(addr, val as u8);
+        self.write8(addr.wrapping_add(1), (val >> 8) as u8);
+        self.write8(addr.wrapping_add(2), (val >> 16) as u8);
+        self.write8(addr.wrapping_add(3), (val >> 24) as u8);
+    }
+}
