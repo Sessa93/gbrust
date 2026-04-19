@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -17,6 +18,9 @@ enum Emulator {
     Gba(GbaEmulator),
 }
 
+/// Target frame duration: GBC and GBA both run at ~59.7275 Hz.
+const FRAME_DURATION: Duration = Duration::from_nanos(16_742_706);
+
 pub struct EmuApp {
     emu: Emulator,
     rom_path: Option<PathBuf>,
@@ -27,6 +31,7 @@ pub struct EmuApp {
     save_slot: u8,
     status_msg: String,
     paused: bool,
+    last_frame_time: Instant,
 }
 
 struct AudioStream {
@@ -50,6 +55,7 @@ impl EmuApp {
             save_slot: 1,
             status_msg: "No ROM loaded. File -> Open ROM".to_string(),
             paused: false,
+            last_frame_time: Instant::now(),
         }
     }
 
@@ -309,8 +315,14 @@ impl eframe::App for EmuApp {
         // Handle input
         self.handle_input(ctx);
 
-        // Run emulator frame
-        if !self.paused {
+        // Run emulator frame with timing control
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_frame_time);
+        let should_run = elapsed >= FRAME_DURATION;
+
+        if !self.paused && should_run {
+            self.last_frame_time = now;
+
             let framebuffer: Vec<u32> = match &mut self.emu {
                 Emulator::Gbc(emu) => emu.run_frame().to_vec(),
                 Emulator::Gba(emu) => emu.run_frame().to_vec(),
@@ -406,9 +418,14 @@ impl eframe::App for EmuApp {
             }
         }
 
-        // Request continuous repaint when emulating
+        // Schedule next repaint at the right time for ~59.73 Hz
         if !matches!(self.emu, Emulator::None) && !self.paused {
-            ctx.request_repaint();
+            let since_frame = Instant::now().duration_since(self.last_frame_time);
+            if since_frame < FRAME_DURATION {
+                ctx.request_repaint_after(FRAME_DURATION - since_frame);
+            } else {
+                ctx.request_repaint();
+            }
         }
     }
 
