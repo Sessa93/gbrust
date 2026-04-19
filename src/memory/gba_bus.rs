@@ -82,8 +82,16 @@ impl GbaBus {
     }
 
     pub fn tick(&mut self, cycles: u32) {
-        let ppu_irqs = self.ppu.tick(cycles);
-        self.iflag |= ppu_irqs;
+        let ppu_events = self.ppu.tick(cycles);
+        self.iflag |= ppu_events & 0x07; // Lower bits are IRQ flags
+
+        // Trigger DMA on VBlank/HBlank events
+        if ppu_events & 0x0100 != 0 {
+            self.dma.notify_vblank();
+        }
+        if ppu_events & 0x0200 != 0 {
+            self.dma.notify_hblank();
+        }
 
         let timer_irqs = self.timers.tick(cycles);
         self.iflag |= timer_irqs;
@@ -100,9 +108,11 @@ impl GbaBus {
                 continue;
             }
             let count = self.dma.channels[ch].count as u32;
-            if count == 0 {
-                continue;
-            }
+            let count = if count == 0 {
+                if ch == 3 { 0x10000 } else { 0x4000 }
+            } else {
+                count
+            };
 
             let word_size = if self.dma.channels[ch].word_size { 4u32 } else { 2 };
             let src_inc: i32 = match self.dma.channels[ch].src_control {
@@ -139,7 +149,12 @@ impl GbaBus {
             }
 
             if self.dma.channels[ch].repeat && self.dma.channels[ch].timing != 0 {
-                self.dma.channels[ch].active = true;
+                // Wait for next VBlank/HBlank trigger
+                self.dma.channels[ch].active = false;
+                // Reload dst if dst_control is increment/reload
+                if self.dma.channels[ch].dst_control == 3 {
+                    self.dma.channels[ch].dst_addr = self.dma.channels[ch].dst_latch;
+                }
             } else {
                 self.dma.channels[ch].active = false;
                 self.dma.channels[ch].enabled = false;

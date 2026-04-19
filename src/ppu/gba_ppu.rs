@@ -97,6 +97,7 @@ impl GbaPpu {
 
             // HBlank
             if self.vcount < 160 {
+                irqs |= 0x0200; // HBlank event (for DMA)
                 if self.dispstat & 0x10 != 0 {
                     irqs |= 0x02; // HBlank IRQ
                 }
@@ -112,6 +113,7 @@ impl GbaPpu {
             if self.vcount == 160 {
                 // VBlank start
                 self.frame_ready = true;
+                irqs |= 0x0100; // VBlank event (for DMA)
                 if self.dispstat & 0x08 != 0 {
                     irqs |= 0x01; // VBlank IRQ
                 }
