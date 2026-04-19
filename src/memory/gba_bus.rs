@@ -143,6 +143,8 @@ impl GbaBus {
             } else {
                 self.dma.channels[ch].active = false;
                 self.dma.channels[ch].enabled = false;
+                // Clear enable bit in control register so games polling it see completion
+                self.dma.channels[ch].control &= !0x8000;
             }
 
             if self.dma.channels[ch].irq {
@@ -151,19 +153,37 @@ impl GbaBus {
         }
     }
 
-    fn read16_dma(&self, addr: u32) -> u16 {
+    fn read16_dma(&mut self, addr: u32) -> u16 {
+        if addr >> 24 == 0x0D && self.cart.backup_type == crate::cartridge::GbaBackupType::Eeprom {
+            let val = self.cart.eeprom_read() as u16;
+            self.cart.eeprom_read_advance();
+            return val;
+        }
         self.read16(addr)
     }
 
-    fn read32_dma(&self, addr: u32) -> u32 {
+    fn read32_dma(&mut self, addr: u32) -> u32 {
+        if addr >> 24 == 0x0D && self.cart.backup_type == crate::cartridge::GbaBackupType::Eeprom {
+            let val = self.cart.eeprom_read() as u32;
+            self.cart.eeprom_read_advance();
+            return val;
+        }
         self.read32(addr)
     }
 
     fn write16_dma(&mut self, addr: u32, val: u16) {
+        if addr >> 24 == 0x0D && self.cart.backup_type == crate::cartridge::GbaBackupType::Eeprom {
+            self.cart.eeprom_write(val as u8);
+            return;
+        }
         self.write16(addr, val);
     }
 
     fn write32_dma(&mut self, addr: u32, val: u32) {
+        if addr >> 24 == 0x0D && self.cart.backup_type == crate::cartridge::GbaBackupType::Eeprom {
+            self.cart.eeprom_write(val as u8);
+            return;
+        }
         self.write32(addr, val);
     }
 
@@ -295,7 +315,15 @@ impl Arm7Bus for GbaBus {
                 self.ppu.vram[offset]
             }
             0x07 => self.ppu.oam[(addr & 0x3FF) as usize],
-            0x08..=0x0D => self.cart.read_rom(addr),
+            0x08..=0x0C => self.cart.read_rom(addr),
+            0x0D => {
+                use crate::cartridge::GbaBackupType;
+                if self.cart.backup_type == GbaBackupType::Eeprom {
+                    self.cart.eeprom_read()
+                } else {
+                    self.cart.read_rom(addr)
+                }
+            }
             0x0E..=0x0F => self.cart.read_sram(addr),
             _ => 0,
         }
@@ -337,6 +365,12 @@ impl Arm7Bus for GbaBus {
                 }
             }
             0x07 => {} // OAM ignores 8-bit writes
+            0x0D => {
+                use crate::cartridge::GbaBackupType;
+                if self.cart.backup_type == GbaBackupType::Eeprom {
+                    self.cart.eeprom_write(val);
+                }
+            }
             0x0E..=0x0F => self.cart.write_sram(addr, val),
             _ => {}
         }

@@ -152,6 +152,25 @@ pub struct GbaCartridge {
     pub flash_state: u8,
     pub flash_cmd_stage: u8,
     pub flash_id_mode: bool,
+    // EEPROM serial state
+    pub eeprom_state: EepromState,
+    pub eeprom_buffer: u64,
+    pub eeprom_bits_written: u8,
+    pub eeprom_address: u16,
+    pub eeprom_bits_read: u8,
+    pub eeprom_read_buffer: u64,
+    pub eeprom_addr_len: u8, // 6 or 14 bits
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EepromState {
+    Idle,
+    ReadingCommand,
+    ReadingAddress,
+    WritingData,
+    WritingFinish,
+    ReadReady,
+    ReadingData,
 }
 
 impl GbaCartridge {
@@ -172,6 +191,8 @@ impl GbaCartridge {
             GbaBackupType::None => (vec![0xFF; 0x8000], vec![], vec![]),
         };
 
+        let eeprom_addr_len = if data.len() > 16 * 1024 * 1024 { 14 } else { 6 };
+
         Self {
             rom: data,
             sram,
@@ -183,6 +204,13 @@ impl GbaCartridge {
             flash_state: 0,
             flash_cmd_stage: 0,
             flash_id_mode: false,
+            eeprom_state: EepromState::Idle,
+            eeprom_buffer: 0,
+            eeprom_bits_written: 0,
+            eeprom_address: 0,
+            eeprom_bits_read: 0,
+            eeprom_read_buffer: 0,
+            eeprom_addr_len,
         }
     }
 
@@ -297,6 +325,124 @@ impl GbaCartridge {
             // Bank switch
             self.flash_bank = val & 1;
             self.flash_state = 0;
+        }
+    }
+
+    pub fn eeprom_read(&self) -> u8 {
+        match self.eeprom_state {
+            EepromState::ReadingData => {
+                // Return one bit at a time from read_buffer, MSB first
+                let bit = if self.eeprom_bits_read < 4 {
+                    // First 4 bits are garbage (return 0)
+                    0
+                } else {
+                    let data_bit = self.eeprom_bits_read - 4;
+                    let bit_idx = 63u8.saturating_sub(data_bit);
+                    ((self.eeprom_read_buffer >> bit_idx) & 1) as u8
+                };
+                bit
+            }
+            _ => 1, // Ready/idle: return 1
+        }
+    }
+
+    pub fn eeprom_read_advance(&mut self) {
+        if self.eeprom_state == EepromState::ReadingData {
+            self.eeprom_bits_read += 1;
+            if self.eeprom_bits_read >= 68 {
+                self.eeprom_state = EepromState::Idle;
+            }
+        }
+    }
+
+    pub fn eeprom_write(&mut self, val: u8) {
+        let bit = val & 1;
+
+        match self.eeprom_state {
+            EepromState::Idle => {
+                self.eeprom_buffer = bit as u64;
+                self.eeprom_bits_written = 1;
+                self.eeprom_state = EepromState::ReadingCommand;
+            }
+            EepromState::ReadingCommand => {
+                self.eeprom_buffer = (self.eeprom_buffer << 1) | bit as u64;
+                self.eeprom_bits_written += 1;
+                if self.eeprom_bits_written == 2 {
+                    let cmd = self.eeprom_buffer & 3;
+                    self.eeprom_buffer = 0;
+                    self.eeprom_bits_written = 0;
+                    self.eeprom_address = 0;
+                    match cmd {
+                        3 => {
+                            // Read command (11)
+                            self.eeprom_state = EepromState::ReadingAddress;
+                        }
+                        2 => {
+                            // Write command (10)
+                            self.eeprom_state = EepromState::ReadingAddress;
+                        }
+                        _ => {
+                            self.eeprom_state = EepromState::Idle;
+                        }
+                    }
+                }
+            }
+            EepromState::ReadingAddress => {
+                self.eeprom_address = (self.eeprom_address << 1) | bit as u16;
+                self.eeprom_bits_written += 1;
+                if self.eeprom_bits_written >= self.eeprom_addr_len {
+                    self.eeprom_bits_written = 0;
+                    self.eeprom_state = EepromState::ReadReady;
+                }
+            }
+            EepromState::ReadReady => {
+                // This 0-bit terminates the command
+                if bit == 0 {
+                    // Read: load 64 bits from EEPROM
+                    let addr = self.eeprom_address as usize;
+                    let byte_addr = addr * 8;
+                    self.eeprom_read_buffer = 0;
+                    for i in 0..8 {
+                        let b = if byte_addr + i < self.eeprom.len() {
+                            self.eeprom[byte_addr + i]
+                        } else {
+                            0xFF
+                        };
+                        self.eeprom_read_buffer = (self.eeprom_read_buffer << 8) | b as u64;
+                    }
+                    self.eeprom_bits_read = 0;
+                    self.eeprom_state = EepromState::ReadingData;
+                } else {
+                    // Write: start collecting 64 data bits
+                    self.eeprom_buffer = bit as u64;
+                    self.eeprom_bits_written = 1;
+                    self.eeprom_state = EepromState::WritingData;
+                }
+            }
+            EepromState::WritingData => {
+                self.eeprom_buffer = (self.eeprom_buffer << 1) | bit as u64;
+                self.eeprom_bits_written += 1;
+                if self.eeprom_bits_written >= 64 {
+                    // Write 8 bytes to EEPROM
+                    let addr = self.eeprom_address as usize;
+                    let byte_addr = addr * 8;
+                    for i in 0..8 {
+                        let b = ((self.eeprom_buffer >> (56 - i * 8)) & 0xFF) as u8;
+                        if byte_addr + i < self.eeprom.len() {
+                            self.eeprom[byte_addr + i] = b;
+                        }
+                    }
+                    self.eeprom_state = EepromState::WritingFinish;
+                }
+            }
+            EepromState::WritingFinish => {
+                // End bit after write
+                self.eeprom_state = EepromState::Idle;
+            }
+            EepromState::ReadingData => {
+                // Shouldn't write during read, go back to idle
+                self.eeprom_state = EepromState::Idle;
+            }
         }
     }
 }
