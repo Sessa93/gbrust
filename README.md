@@ -33,15 +33,15 @@ Use **File → Open ROM** to load a `.gb`, `.gbc`, or `.gba` file.
 
 ## Controls
 
-| Key | Button |
-|---|---|
-| Z | A |
-| X | B |
-| Enter | Start |
-| Backspace | Select |
-| Arrow keys | D-Pad |
-| A | L |
-| S | R |
+| Key        | Button |
+| ---------- | ------ |
+| Z          | A      |
+| X          | B      |
+| Enter      | Start  |
+| Backspace  | Select |
+| Arrow keys | D-Pad  |
+| A          | L      |
+| S          | R      |
 
 ## Save & Load
 

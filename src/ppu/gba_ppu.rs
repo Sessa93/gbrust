@@ -85,23 +85,8 @@ impl GbaPpu {
         let mut irqs = 0u16;
         self.cycles += cycles;
 
-        // 4 cycles per dot, 308 scanlines, 1232 cycles per line
-        while self.cycles >= 4 {
-            self.cycles -= 4;
-            let dot = (self.cycles / 4) as u16; // not quite right but approx
-
-            // Use a simpler model: count total dots in a line
-            // Each scanline = 308 dots (1232 cycles), 228 scanlines total
-        }
-
-        // Simplified: use cycle counting per scanline
         // 1232 cycles per scanline = 960 (visible) + 272 (hblank)
-        self.cycles += cycles; // re-add since we subtracted
-        self.cycles -= cycles; // undo double-count - let's redo this properly
-
-        // Reset approach: just track raw cycles
-        self.cycles += cycles;
-
+        // 228 scanlines total = 160 visible + 68 vblank
         while self.cycles >= 1232 {
             self.cycles -= 1232;
 

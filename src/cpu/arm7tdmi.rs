@@ -210,7 +210,7 @@ impl Arm7Tdmi {
         let old_cpsr = self.cpsr;
         self.switch_mode(CpuMode::Irq);
         self.spsr[CpuMode::Irq.bank_index()] = old_cpsr;
-        self.regs[14] = self.regs[15].wrapping_add(if self.thumb_mode() { 2 } else { 0 });
+        self.regs[14] = self.regs[15].wrapping_add(4);
         self.cpsr = (self.cpsr & !CPSR_T) | CPSR_I;
         self.regs[15] = 0x0000_0018;
         self.halted = false;
@@ -262,7 +262,7 @@ impl Arm7Tdmi {
 
             // Software Interrupt
             _ if bits_27_20 >> 4 == 0xF => {
-                self.arm_swi(bus);
+                self.arm_swi(instr, bus);
                 3
             }
 
@@ -271,9 +271,10 @@ impl Arm7Tdmi {
                 let link = instr & (1 << 24) != 0;
                 let offset = ((instr & 0x00FF_FFFF) as i32) << 8 >> 6;
                 if link {
-                    self.regs[14] = self.regs[15].wrapping_sub(4);
+                    self.regs[14] = self.regs[15]; // next instruction after BL
                 }
-                self.regs[15] = (self.regs[15] as i32).wrapping_add(offset) as u32;
+                // PC+8 semantics: add 4 extra since we only advanced by 4
+                self.regs[15] = ((self.regs[15].wrapping_add(4)) as i32).wrapping_add(offset) as u32;
                 3
             }
 
@@ -538,6 +539,10 @@ impl Arm7Tdmi {
             _ => unreachable!(),
         };
 
+        // Handle writes to PC for non-test operations
+        if rd == 15 && !matches!(opcode, 0x8 | 0x9 | 0xA | 0xB) {
+            self.regs[15] = result;
+        }
         if rd == 15 && set_flags {
             self.cpsr = self.spsr[self.current_mode().bank_index()];
         }
@@ -806,13 +811,9 @@ impl Arm7Tdmi {
         }
     }
 
-    fn arm_swi(&mut self, _bus: &mut impl Arm7Bus) {
-        let old_cpsr = self.cpsr;
-        self.switch_mode(CpuMode::Supervisor);
-        self.spsr[CpuMode::Supervisor.bank_index()] = old_cpsr;
-        self.regs[14] = self.regs[15].wrapping_sub(4);
-        self.cpsr = (self.cpsr & !CPSR_T) | CPSR_I;
-        self.regs[15] = 0x0000_0008;
+    fn arm_swi(&mut self, instr: u32, bus: &mut impl Arm7Bus) {
+        let swi_num = (instr >> 16) & 0xFF;
+        self.handle_swi(swi_num, bus);
     }
 
     // THUMB instruction execution
@@ -1175,7 +1176,7 @@ impl Arm7Tdmi {
     fn thumb_pc_relative_load(&mut self, instr: u32, bus: &impl Arm7Bus) -> u32 {
         let rd = ((instr >> 8) & 7) as usize;
         let offset = (instr & 0xFF) << 2;
-        let addr = (self.regs[15] & !2).wrapping_add(offset);
+        let addr = (self.regs[15].wrapping_add(2) & !2).wrapping_add(offset);
         self.regs[rd] = bus.read32(addr & !3);
         3
     }
@@ -1267,7 +1268,7 @@ impl Arm7Tdmi {
         self.regs[rd] = if sp {
             self.regs[13].wrapping_add(offset)
         } else {
-            (self.regs[15] & !2).wrapping_add(offset)
+            (self.regs[15].wrapping_add(2) & !2).wrapping_add(offset)
         };
         1
     }
@@ -1351,7 +1352,7 @@ impl Arm7Tdmi {
         let cond = (instr >> 8) & 0xF;
         if self.condition_passed(cond) {
             let offset = ((instr & 0xFF) as i8 as i32) << 1;
-            self.regs[15] = (self.regs[15] as i32).wrapping_add(offset) as u32;
+            self.regs[15] = ((self.regs[15].wrapping_add(2)) as i32).wrapping_add(offset) as u32;
             3
         } else {
             1
@@ -1360,7 +1361,7 @@ impl Arm7Tdmi {
 
     fn thumb_unconditional_branch(&mut self, instr: u32) -> u32 {
         let offset = (((instr & 0x7FF) as i32) << 21) >> 20;
-        self.regs[15] = (self.regs[15] as i32).wrapping_add(offset) as u32;
+        self.regs[15] = ((self.regs[15].wrapping_add(2)) as i32).wrapping_add(offset) as u32;
         3
     }
 
@@ -1371,25 +1372,149 @@ impl Arm7Tdmi {
         if !hi {
             // First instruction: LR = PC + (offset << 12)
             let off = ((offset as i32) << 21) >> 9;
-            self.regs[14] = (self.regs[15] as i32).wrapping_add(off) as u32;
+            self.regs[14] = ((self.regs[15].wrapping_add(2)) as i32).wrapping_add(off) as u32;
             1
         } else {
-            // Second instruction: PC = LR + (offset << 1)
-            let next_pc = self.regs[15].wrapping_sub(2);
+            // Second instruction: PC = LR + (offset << 1), LR = next_instr | 1
+            let next_pc = self.regs[15]; // address of next instruction
             self.regs[15] = self.regs[14].wrapping_add(offset << 1);
             self.regs[14] = next_pc | 1;
             3
         }
     }
 
-    fn thumb_swi(&mut self, _bus: &mut impl Arm7Bus) -> u32 {
-        let old_cpsr = self.cpsr;
-        self.switch_mode(CpuMode::Supervisor);
-        self.spsr[CpuMode::Supervisor.bank_index()] = old_cpsr;
-        self.regs[14] = self.regs[15].wrapping_sub(2);
-        self.cpsr = (self.cpsr & !CPSR_T) | CPSR_I;
-        self.regs[15] = 0x0000_0008;
+    fn thumb_swi(&mut self, bus: &mut impl Arm7Bus) -> u32 {
+        let swi_instr = bus.read16(self.regs[15].wrapping_sub(2) & !1);
+        let swi_num = (swi_instr & 0xFF) as u32;
+        self.handle_swi(swi_num, bus);
         3
+    }
+
+    fn handle_swi(&mut self, num: u32, bus: &mut impl Arm7Bus) {
+        match num {
+            0x02 => {
+                // Halt
+                self.halted = true;
+            }
+            0x04 => {
+                // IntrWait
+                self.halted = true;
+            }
+            0x05 => {
+                // VBlankIntrWait
+                self.halted = true;
+            }
+            0x06 => {
+                // Div: R0/R1
+                let num = self.regs[0] as i32;
+                let den = self.regs[1] as i32;
+                if den != 0 {
+                    self.regs[0] = (num / den) as u32;
+                    self.regs[1] = (num % den) as u32;
+                    self.regs[3] = (num / den).unsigned_abs();
+                }
+            }
+            0x07 => {
+                // DivArm: R1/R0
+                let num = self.regs[1] as i32;
+                let den = self.regs[0] as i32;
+                if den != 0 {
+                    self.regs[0] = (num / den) as u32;
+                    self.regs[1] = (num % den) as u32;
+                    self.regs[3] = (num / den).unsigned_abs();
+                }
+            }
+            0x08 => {
+                // Sqrt
+                let val = self.regs[0];
+                self.regs[0] = (val as f64).sqrt() as u32;
+            }
+            0x0B => {
+                // CpuSet
+                let src = self.regs[0];
+                let dst = self.regs[1];
+                let ctrl = self.regs[2];
+                let count = ctrl & 0x1FFFFF;
+                let fill = ctrl & (1 << 24) != 0;
+                let word = ctrl & (1 << 26) != 0;
+
+                if word {
+                    let fill_val = if fill { bus.read32(src) } else { 0 };
+                    for i in 0..count {
+                        let val = if fill { fill_val } else { bus.read32(src.wrapping_add(i * 4)) };
+                        bus.write32(dst.wrapping_add(i * 4), val);
+                    }
+                } else {
+                    let fill_val = if fill { bus.read16(src) } else { 0 };
+                    for i in 0..count {
+                        let val = if fill { fill_val } else { bus.read16(src.wrapping_add(i * 2)) };
+                        bus.write16(dst.wrapping_add(i * 2), val);
+                    }
+                }
+            }
+            0x0C => {
+                // CpuFastSet (32-bit, multiples of 8 words)
+                let src = self.regs[0];
+                let dst = self.regs[1];
+                let ctrl = self.regs[2];
+                let count = (ctrl & 0x1FFFFF) & !7;
+                let fill = ctrl & (1 << 24) != 0;
+                let fill_val = if fill { bus.read32(src) } else { 0 };
+
+                for i in 0..count {
+                    let val = if fill { fill_val } else { bus.read32(src.wrapping_add(i * 4)) };
+                    bus.write32(dst.wrapping_add(i * 4), val);
+                }
+            }
+            0x11 | 0x12 => {
+                // LZ77 decompress
+                self.swi_lz77_decompress(bus);
+            }
+            _ => {
+                log::warn!("Unimplemented SWI: 0x{:02X}", num);
+            }
+        }
+    }
+
+    fn swi_lz77_decompress(&mut self, bus: &mut impl Arm7Bus) {
+        let src = self.regs[0];
+        let dst = self.regs[1];
+        let header = bus.read32(src);
+        let decompressed_size = header >> 8;
+
+        let mut src_pos = src + 4;
+        let mut dst_pos = dst;
+        let mut remaining = decompressed_size;
+
+        while remaining > 0 {
+            let flags = bus.read8(src_pos);
+            src_pos += 1;
+
+            for bit in (0..8).rev() {
+                if remaining == 0 {
+                    break;
+                }
+                if flags & (1 << bit) != 0 {
+                    let b1 = bus.read8(src_pos) as u32;
+                    let b2 = bus.read8(src_pos + 1) as u32;
+                    src_pos += 2;
+                    let length = ((b1 >> 4) + 3).min(remaining);
+                    let disp = ((b1 & 0xF) << 8 | b2) + 1;
+                    for _ in 0..length {
+                        let val = bus.read8(dst_pos.wrapping_sub(disp));
+                        bus.write8(dst_pos, val);
+                        dst_pos += 1;
+                        remaining -= 1;
+                    }
+                } else {
+                    let val = bus.read8(src_pos);
+                    src_pos += 1;
+                    bus.write8(dst_pos, val);
+                    dst_pos += 1;
+                    remaining -= 1;
+                }
+            }
+        }
     }
 }
 

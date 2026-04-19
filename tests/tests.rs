@@ -355,10 +355,10 @@ mod tests {
         fn arm_branch() {
             let mut cpu = Arm7Tdmi::new();
             let mut bus = TestBus::new();
-            // B with offset 0: PC is advanced by 4 before execute, so target = PC+4+offset
+            // B with offset 0: PC+8 semantics, target = PC+4+4+offset = PC+8
             write_arm(&mut bus, 0x0800_0000, 0xEA00_0000);
             cpu.step(&mut bus);
-            assert_eq!(cpu.regs[15], 0x0800_0004);
+            assert_eq!(cpu.regs[15], 0x0800_0008);
         }
 
         #[test]

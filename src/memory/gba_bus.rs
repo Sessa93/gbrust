@@ -56,15 +56,28 @@ impl GbaBus {
 
     fn generate_hle_bios() -> Vec<u8> {
         let mut bios = vec![0u8; BIOS_SIZE];
-        // Jump to cartridge
-        // MOV R15, #0x08000000
-        let instr: u32 = 0xE3A0_F302; // MOV PC, #0x08000000
-        bios[0..4].copy_from_slice(&instr.to_le_bytes());
-        // SWI handler at 0x08 - return from SWI
-        let movs: u32 = 0xE1B0_F00E; // MOVS PC, LR
-        bios[0x08..0x0C].copy_from_slice(&movs.to_le_bytes());
-        // IRQ handler at 0x18
-        bios[0x18..0x1C].copy_from_slice(&movs.to_le_bytes());
+        // Reset vector: Jump to cartridge at 0x08000000
+        let reset: u32 = 0xE3A0_F302; // MOV PC, #0x08000000
+        bios[0..4].copy_from_slice(&reset.to_le_bytes());
+        // SWI handler at 0x08 - handled via HLE, fallback returns
+        let movs_pc_lr: u32 = 0xE1B0_F00E; // MOVS PC, LR
+        bios[0x08..0x0C].copy_from_slice(&movs_pc_lr.to_le_bytes());
+        // IRQ handler at 0x18 - dispatch to user handler at [0x03007FFC]
+        let irq_code: [u32; 9] = [
+            0xE92D_500F, // STMFD SP!, {R0-R3, R12, LR}
+            0xE3A0_0403, // MOV R0, #0x03000000
+            0xE280_0C7F, // ADD R0, R0, #0x7F00
+            0xE280_00FC, // ADD R0, R0, #0xFC
+            0xE590_0000, // LDR R0, [R0]              ; load handler addr
+            0xE1A0_E00F, // MOV LR, PC                ; return addr
+            0xE12F_FF10, // BX R0                     ; call handler
+            0xE8BD_500F, // LDMFD SP!, {R0-R3, R12, LR}
+            0xE25E_F004, // SUBS PC, LR, #4           ; return from IRQ
+        ];
+        for (i, &word) in irq_code.iter().enumerate() {
+            let offset = 0x18 + i * 4;
+            bios[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
         bios
     }
 
@@ -163,11 +176,7 @@ impl GbaBus {
         match offset {
             // Display
             0x000..=0x001 => self.ppu.read_io(0x0400_0000 + offset) as u8,
-            0x002..=0x003 => {
-                // DISPSTAT
-                let v = self.ppu.read_dispstat();
-                if off & 1 == 0 { v as u8 } else { (v >> 8) as u8 }
-            }
+            0x002..=0x003 => 0, // Green Swap (unused)
             0x004..=0x005 => {
                 let v = self.ppu.read_dispstat();
                 if off & 1 == 0 { v as u8 } else { (v >> 8) as u8 }
@@ -226,7 +235,7 @@ impl GbaBus {
             0x000..=0x001 | 0x008..=0x05F => {
                 self.ppu.write_io(0x0400_0000 + offset, val);
             }
-            0x002..=0x003 => self.ppu.write_dispstat(offset & 1, val),
+            0x002..=0x003 => {} // Green Swap (unused)
             0x004..=0x005 => self.ppu.write_dispstat(offset & 1, val),
 
             // Sound
@@ -334,14 +343,37 @@ impl Arm7Bus for GbaBus {
     }
 
     fn write16(&mut self, addr: u32, val: u16) {
-        self.write8(addr, val as u8);
-        self.write8(addr.wrapping_add(1), (val >> 8) as u8);
+        let addr = addr & !1;
+        match addr >> 24 {
+            0x05 => {
+                let offset = (addr & 0x3FE) as usize;
+                self.ppu.palette[offset] = val as u8;
+                self.ppu.palette[offset + 1] = (val >> 8) as u8;
+            }
+            0x06 => {
+                let offset = (addr & 0x1FFFE) as usize;
+                let offset = if offset >= 0x18000 { offset - 0x8000 } else { offset };
+                if offset + 1 < self.ppu.vram.len() {
+                    self.ppu.vram[offset] = val as u8;
+                    self.ppu.vram[offset + 1] = (val >> 8) as u8;
+                }
+            }
+            0x07 => {
+                let offset = (addr & 0x3FE) as usize;
+                if offset + 1 < self.ppu.oam.len() {
+                    self.ppu.oam[offset] = val as u8;
+                    self.ppu.oam[offset + 1] = (val >> 8) as u8;
+                }
+            }
+            _ => {
+                self.write8(addr, val as u8);
+                self.write8(addr.wrapping_add(1), (val >> 8) as u8);
+            }
+        }
     }
 
     fn write32(&mut self, addr: u32, val: u32) {
-        self.write8(addr, val as u8);
-        self.write8(addr.wrapping_add(1), (val >> 8) as u8);
-        self.write8(addr.wrapping_add(2), (val >> 16) as u8);
-        self.write8(addr.wrapping_add(3), (val >> 24) as u8);
+        self.write16(addr, val as u16);
+        self.write16(addr.wrapping_add(2), (val >> 16) as u16);
     }
 }
