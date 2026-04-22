@@ -93,8 +93,17 @@ impl GbaBus {
             self.dma.notify_hblank();
         }
 
-        let timer_irqs = self.timers.tick(cycles);
+        let (timer_irqs, timer_overflows) = self.timers.tick(cycles);
         self.iflag |= timer_irqs;
+
+        // Propagate timer overflows to APU (advance DirectSound FIFO sample)
+        // and trigger sound DMA channels so they refill the FIFOs.
+        for i in 0..4usize {
+            if timer_overflows & (1 << i) != 0 {
+                self.apu.timer_overflow(i);
+                self.trigger_sound_dma(i);
+            }
+        }
 
         self.apu.tick(cycles);
 
@@ -102,16 +111,42 @@ impl GbaBus {
         self.process_dma();
     }
 
+    /// Activate DMA1/DMA2 sound channels whose tied timer just overflowed.
+    fn trigger_sound_dma(&mut self, timer_id: usize) {
+        let fifo_a_timer = if self.apu.soundcnt_h & 0x0400 != 0 { 1usize } else { 0 };
+        let fifo_b_timer = if self.apu.soundcnt_h & 0x4000 != 0 { 1usize } else { 0 };
+        for ch in 1..=2usize {
+            if self.dma.channels[ch].enabled && self.dma.channels[ch].timing == 3 {
+                let dst = self.dma.channels[ch].dst_addr;
+                let fifo_ready = if dst == 0x0400_00A0 {
+                    timer_id == fifo_a_timer && self.apu.fifo_a.len() <= 16
+                } else if dst == 0x0400_00A4 {
+                    timer_id == fifo_b_timer && self.apu.fifo_b.len() <= 16
+                } else {
+                    false
+                };
+                if fifo_ready {
+                    self.dma.channels[ch].active = true;
+                }
+            }
+        }
+    }
+
     fn process_dma(&mut self) {
         for ch in 0..4 {
             if !self.dma.channels[ch].active {
                 continue;
             }
-            let count = self.dma.channels[ch].count as u32;
-            let count = if count == 0 {
-                if ch == 3 { 0x10000 } else { 0x4000 }
+            // DirectSound DMA (ch 1/2, timing=3) always transfers exactly 4 words.
+            let count = if (ch == 1 || ch == 2) && self.dma.channels[ch].timing == 3 {
+                4u32
             } else {
-                count
+                let c = self.dma.channels[ch].count as u32;
+                if c == 0 {
+                    if ch == 3 { 0x10000 } else { 0x4000 }
+                } else {
+                    c
+                }
             };
 
             let word_size = if self.dma.channels[ch].word_size { 4u32 } else { 2 };
@@ -130,6 +165,12 @@ impl GbaBus {
 
             let mut src = self.dma.channels[ch].src_addr;
             let mut dst = self.dma.channels[ch].dst_addr;
+
+            if self.cart.backup_type == crate::cartridge::GbaBackupType::Eeprom
+                && ((src >> 24 == 0x0D) || (dst >> 24 == 0x0D))
+            {
+                self.cart.notify_eeprom_dma(count);
+            }
 
             for _ in 0..count {
                 if word_size == 4 {
@@ -344,13 +385,23 @@ impl Arm7Bus for GbaBus {
         }
     }
 
-    fn read16(&self, addr: u32) -> u16 {
+    fn read16(&mut self, addr: u32) -> u16 {
+        if addr >> 24 == 0x0D && self.cart.backup_type == crate::cartridge::GbaBackupType::Eeprom {
+            let val = self.cart.eeprom_read() as u16;
+            self.cart.eeprom_read_advance();
+            return val;
+        }
         let lo = self.read8(addr) as u16;
         let hi = self.read8(addr.wrapping_add(1)) as u16;
         lo | (hi << 8)
     }
 
-    fn read32(&self, addr: u32) -> u32 {
+    fn read32(&mut self, addr: u32) -> u32 {
+        if addr >> 24 == 0x0D && self.cart.backup_type == crate::cartridge::GbaBackupType::Eeprom {
+            let val = self.cart.eeprom_read() as u32;
+            self.cart.eeprom_read_advance();
+            return val;
+        }
         let b0 = self.read8(addr) as u32;
         let b1 = self.read8(addr.wrapping_add(1)) as u32;
         let b2 = self.read8(addr.wrapping_add(2)) as u32;
@@ -393,6 +444,10 @@ impl Arm7Bus for GbaBus {
 
     fn write16(&mut self, addr: u32, val: u16) {
         let addr = addr & !1;
+        if addr >> 24 == 0x0D && self.cart.backup_type == crate::cartridge::GbaBackupType::Eeprom {
+            self.cart.eeprom_write(val as u8);
+            return;
+        }
         match addr >> 24 {
             0x05 => {
                 let offset = (addr & 0x3FE) as usize;
@@ -422,6 +477,10 @@ impl Arm7Bus for GbaBus {
     }
 
     fn write32(&mut self, addr: u32, val: u32) {
+        if addr >> 24 == 0x0D && self.cart.backup_type == crate::cartridge::GbaBackupType::Eeprom {
+            self.cart.eeprom_write(val as u8);
+            return;
+        }
         self.write16(addr, val as u16);
         self.write16(addr.wrapping_add(2), (val >> 16) as u16);
     }

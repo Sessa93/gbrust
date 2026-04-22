@@ -67,7 +67,7 @@ impl SquareChannel {
             return 0.0;
         }
         let sample = DUTY_TABLE[self.duty as usize][self.duty_pos as usize];
-        (sample as f32) * (self.volume as f32) / 15.0
+        ((sample as f32) * 2.0 - 1.0) * (self.volume as f32) / 15.0
     }
 
     pub fn clock_length(&mut self) {
@@ -190,15 +190,15 @@ impl WaveChannel {
         if !self.enabled || !self.dac_enabled {
             return 0.0;
         }
-        let shift = match self.volume_code {
-            0 => 4, // Mute
-            1 => 0, // 100%
-            2 => 1, // 50%
-            3 => 2, // 25%
-            _ => 4,
+        let volume = match self.volume_code {
+            0 => return 0.0,
+            1 => 1.0,
+            2 => 0.5,
+            3 => 0.25,
+            _ => return 0.0,
         };
-        let sample = self.sample_buffer >> shift;
-        (sample as f32) / 15.0
+        let centered = (self.sample_buffer as f32 / 15.0) * 2.0 - 1.0;
+        centered * volume
     }
 
     pub fn clock_length(&mut self) {
@@ -279,7 +279,7 @@ impl NoiseChannel {
             return 0.0;
         }
         let bit = (!self.lfsr & 1) as f32;
-        bit * (self.volume as f32) / 15.0
+        (bit * 2.0 - 1.0) * (self.volume as f32) / 15.0
     }
 
     pub fn clock_length(&mut self) {

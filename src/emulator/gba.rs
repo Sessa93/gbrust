@@ -11,6 +11,8 @@ pub struct GbaEmulator {
     pub bus: GbaBus,
     pub frame_cycles: u32,
     pub total_frames: u64,
+    #[serde(default, skip)]
+    pub repair_legacy_palette_state: bool,
 }
 
 impl GbaEmulator {
@@ -20,6 +22,7 @@ impl GbaEmulator {
             bus: GbaBus::new(cart),
             frame_cycles: 0,
             total_frames: 0,
+            repair_legacy_palette_state: false,
         }
     }
 
@@ -31,6 +34,12 @@ impl GbaEmulator {
         self.frame_cycles = 0;
 
         while self.frame_cycles < CYCLES_PER_FRAME {
+            // Propagate bus HALT (HALTCNT write) to CPU
+            if self.bus.halt {
+                self.cpu.halted = true;
+                self.bus.halt = false;
+            }
+
             // Check for IRQ
             if self.bus.check_irq() {
                 self.cpu.handle_irq();
@@ -42,6 +51,11 @@ impl GbaEmulator {
         }
 
         self.total_frames += 1;
+
+        if self.repair_legacy_palette_state && crate::save::gba_palette_has_duplicated_banks(self) {
+            crate::save::repair_gba_palette_state_if_needed(self);
+        }
+
         &self.bus.ppu.framebuffer
     }
 

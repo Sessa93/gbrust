@@ -218,7 +218,9 @@ mod tests {
     // ─── ARM7TDMI CPU Tests ────────────────────────────────
 
     mod arm7tdmi {
+        use gbrust::cartridge::GbaCartridge;
         use gbrust::cpu::arm7tdmi::{Arm7Bus, Arm7Tdmi};
+        use gbrust::memory::gba_bus::GbaBus;
 
         struct TestBus {
             mem: Vec<u8>,
@@ -241,7 +243,7 @@ mod tests {
                     0
                 }
             }
-            fn read16(&self, addr: u32) -> u16 {
+            fn read16(&mut self, addr: u32) -> u16 {
                 let addr = (addr & !1) as usize;
                 if addr + 1 < self.mem.len() {
                     u16::from_le_bytes([self.mem[addr], self.mem[addr + 1]])
@@ -249,7 +251,7 @@ mod tests {
                     0
                 }
             }
-            fn read32(&self, addr: u32) -> u32 {
+            fn read32(&mut self, addr: u32) -> u32 {
                 let addr = (addr & !3) as usize;
                 if addr + 3 < self.mem.len() {
                     u32::from_le_bytes([
@@ -288,7 +290,7 @@ mod tests {
             }
         }
 
-        fn write_arm(bus: &mut TestBus, addr: u32, instr: u32) {
+        fn write_arm(bus: &mut impl Arm7Bus, addr: u32, instr: u32) {
             bus.write32(addr, instr);
         }
 
@@ -397,6 +399,323 @@ mod tests {
             cpu.step(&mut bus);
             assert_eq!(cpu.regs[2], 0xFFFF);
         }
+
+        #[test]
+        fn arm_swi_cpuset_32bit_copy_preserves_halfwords() {
+            let mut cpu = Arm7Tdmi::new();
+            let mut bus = TestBus::new();
+            let src = 0x0200_0000;
+            let dst = 0x0200_0100;
+            let words = [
+                0x5B5F_530E,
+                0x3A5B_4B1F,
+                0x3D27_210F,
+                0x28A3_30E5,
+            ];
+
+            for (index, word) in words.iter().enumerate() {
+                bus.write32(src + (index as u32) * 4, *word);
+            }
+
+            cpu.regs[0] = src;
+            cpu.regs[1] = dst;
+            cpu.regs[2] = 0x0400_0004;
+            write_arm(&mut bus, 0x0800_0000, 0xEF0B_0000);
+            cpu.step(&mut bus);
+
+            for (index, word) in words.iter().enumerate() {
+                assert_eq!(bus.read32(dst + (index as u32) * 4), *word);
+            }
+        }
+
+        #[test]
+        fn arm_swi_cpufastset_copy_preserves_halfwords() {
+            let mut cpu = Arm7Tdmi::new();
+            let mut bus = TestBus::new();
+            let src = 0x0200_1000;
+            let dst = 0x0200_1100;
+            let words = [
+                0x5B5F_530E,
+                0x3A5B_4B1F,
+                0x3D27_210F,
+                0x28A3_30E5,
+                0x779B_1C82,
+                0x2E77_2F1F,
+                0x2118_2D9F,
+                0x0000_7FFF,
+            ];
+
+            for (index, word) in words.iter().enumerate() {
+                bus.write32(src + (index as u32) * 4, *word);
+            }
+
+            cpu.regs[0] = src;
+            cpu.regs[1] = dst;
+            cpu.regs[2] = 8;
+            write_arm(&mut bus, 0x0800_0000, 0xEF0C_0000);
+            cpu.step(&mut bus);
+
+            for (index, word) in words.iter().enumerate() {
+                assert_eq!(bus.read32(dst + (index as u32) * 4), *word);
+            }
+        }
+
+        #[test]
+        fn gba_bus_cpuset_32bit_copy_preserves_halfwords() {
+            let mut cpu = Arm7Tdmi::new();
+            let cart = GbaCartridge::load(vec![0; 0x200]);
+            let mut bus = GbaBus::new(cart);
+            let src = 0x0200_0000;
+            let dst = 0x0200_0100;
+            let code = 0x0200_2000;
+            let words = [
+                0x5B5F_530E,
+                0x3A5B_4B1F,
+                0x3D27_210F,
+                0x28A3_30E5,
+            ];
+
+            for (index, word) in words.iter().enumerate() {
+                bus.write32(src + (index as u32) * 4, *word);
+            }
+
+            cpu.regs[0] = src;
+            cpu.regs[1] = dst;
+            cpu.regs[2] = 0x0400_0004;
+            cpu.regs[15] = code;
+            write_arm(&mut bus, code, 0xEF0B_0000);
+            cpu.step(&mut bus);
+
+            for (index, word) in words.iter().enumerate() {
+                assert_eq!(bus.read32(dst + (index as u32) * 4), *word);
+            }
+        }
+
+        #[test]
+        fn gba_bus_cpuset_full_palette_copy_preserves_halfwords() {
+            let mut cpu = Arm7Tdmi::new();
+            let cart = GbaCartridge::load(vec![0; 0x200]);
+            let mut bus = GbaBus::new(cart);
+            let src = 0x0200_4000;
+            let dst = src + 0x400;
+            let code = 0x0200_4800;
+
+            for index in 0..0x100u32 {
+                let low = (index as u16).wrapping_mul(7).wrapping_add(0x1357);
+                let high = (index as u16).wrapping_mul(11).wrapping_add(0x2468);
+                bus.write32(src + index * 4, (high as u32) << 16 | low as u32);
+            }
+
+            cpu.regs[0] = src;
+            cpu.regs[1] = dst;
+            cpu.regs[2] = 0x0400_0100;
+            cpu.regs[15] = code;
+            write_arm(&mut bus, code, 0xEF0B_0000);
+            cpu.step(&mut bus);
+
+            for index in 0..0x100u32 {
+                let expected = bus.read32(src + index * 4);
+                assert_eq!(bus.read32(dst + index * 4), expected);
+            }
+        }
+
+        #[test]
+        fn gba_bus_cpufastset_copy_preserves_halfwords() {
+            let mut cpu = Arm7Tdmi::new();
+            let cart = GbaCartridge::load(vec![0; 0x200]);
+            let mut bus = GbaBus::new(cart);
+            let src = 0x0200_1000;
+            let dst = 0x0200_1100;
+            let code = 0x0200_3000;
+            let words = [
+                0x5B5F_530E,
+                0x3A5B_4B1F,
+                0x3D27_210F,
+                0x28A3_30E5,
+                0x779B_1C82,
+                0x2E77_2F1F,
+                0x2118_2D9F,
+                0x0000_7FFF,
+            ];
+
+            for (index, word) in words.iter().enumerate() {
+                bus.write32(src + (index as u32) * 4, *word);
+            }
+
+            cpu.regs[0] = src;
+            cpu.regs[1] = dst;
+            cpu.regs[2] = 8;
+            cpu.regs[15] = code;
+            write_arm(&mut bus, code, 0xEF0C_0000);
+            cpu.step(&mut bus);
+
+            for (index, word) in words.iter().enumerate() {
+                assert_eq!(bus.read32(dst + (index as u32) * 4), *word);
+            }
+        }
+
+        #[test]
+        fn gba_bus_dma32_copy_preserves_halfwords() {
+            let cart = GbaCartridge::load(vec![0; 0x200]);
+            let mut bus = GbaBus::new(cart);
+            let src = 0x0200_2000;
+            let dst = 0x0200_2100;
+            let words = [
+                0x5B5F_530E,
+                0x3A5B_4B1F,
+                0x3D27_210F,
+                0x28A3_30E5,
+                0x779B_1C82,
+                0x2E77_2F1F,
+                0x2118_2D9F,
+                0x0000_7FFF,
+            ];
+
+            for (index, word) in words.iter().enumerate() {
+                bus.write32(src + (index as u32) * 4, *word);
+            }
+
+            let channel = &mut bus.dma.channels[3];
+            channel.src_addr = src;
+            channel.dst_addr = dst;
+            channel.count = words.len() as u16;
+            channel.word_size = true;
+            channel.src_control = 0;
+            channel.dst_control = 0;
+            channel.enabled = true;
+            channel.active = true;
+            bus.tick(0);
+
+            for (index, word) in words.iter().enumerate() {
+                assert_eq!(bus.read32(dst + (index as u32) * 4), *word);
+            }
+        }
+
+        #[test]
+        fn gba_bus_dma32_via_io_registers_preserves_halfwords() {
+            let cart = GbaCartridge::load(vec![0; 0x200]);
+            let mut bus = GbaBus::new(cart);
+            let src = 0x0200_3000;
+            let dst = 0x0200_3100;
+            let words = [
+                0x5B5F_530E,
+                0x3A5B_4B1F,
+                0x3D27_210F,
+                0x28A3_30E5,
+                0x779B_1C82,
+                0x2E77_2F1F,
+                0x2118_2D9F,
+                0x0000_7FFF,
+            ];
+
+            for (index, word) in words.iter().enumerate() {
+                bus.write32(src + (index as u32) * 4, *word);
+            }
+
+            bus.write32(0x0400_00B0, src);
+            bus.write32(0x0400_00B4, dst);
+            bus.write32(0x0400_00B8, 0x8400_0008);
+            bus.tick(0);
+
+            for (index, word) in words.iter().enumerate() {
+                assert_eq!(bus.read32(dst + (index as u32) * 4), *word);
+            }
+        }
+
+        #[test]
+        fn gba_bus_dma32_full_palette_copy_preserves_halfwords() {
+            let cart = GbaCartridge::load(vec![0; 0x200]);
+            let mut bus = GbaBus::new(cart);
+            let src = 0x0200_3800;
+            let dst = src + 0x400;
+
+            for index in 0..0x100u32 {
+                let low = (index as u16).wrapping_mul(3).wrapping_add(0x1234);
+                let high = (index as u16).wrapping_mul(5).wrapping_add(0x4567);
+                bus.write32(src + index * 4, (high as u32) << 16 | low as u32);
+            }
+
+            bus.write32(0x0400_00B0, src);
+            bus.write32(0x0400_00B4, dst);
+            bus.write32(0x0400_00B8, 0x8400_0100);
+            bus.tick(0);
+
+            for index in 0..0x100u32 {
+                let expected = bus.read32(src + index * 4);
+                assert_eq!(bus.read32(dst + index * 4), expected);
+            }
+        }
+
+        #[test]
+        fn gba_bus_arm_block_transfer_preserves_halfwords() {
+            let mut cpu = Arm7Tdmi::new();
+            let cart = GbaCartridge::load(vec![0; 0x200]);
+            let mut bus = GbaBus::new(cart);
+            let src = 0x0200_3200;
+            let dst = 0x0200_3300;
+            let code = 0x0200_3400;
+            let words = [
+                0x5B5F_530E,
+                0x3A5B_4B1F,
+                0x3D27_210F,
+                0x28A3_30E5,
+            ];
+
+            for (index, word) in words.iter().enumerate() {
+                bus.write32(src + (index as u32) * 4, *word);
+            }
+
+            cpu.regs[0] = src;
+            cpu.regs[1] = dst;
+            cpu.regs[15] = code;
+            write_arm(&mut bus, code, 0xE8B0_003C);
+            write_arm(&mut bus, code + 4, 0xE8A1_003C);
+
+            cpu.step(&mut bus);
+            cpu.step(&mut bus);
+
+            for (index, word) in words.iter().enumerate() {
+                assert_eq!(bus.read32(dst + (index as u32) * 4), *word);
+            }
+            assert_eq!(cpu.regs[0], src + 16);
+            assert_eq!(cpu.regs[1], dst + 16);
+        }
+
+        #[test]
+        fn gba_bus_thumb_block_transfer_preserves_halfwords() {
+            let mut cpu = Arm7Tdmi::new();
+            let cart = GbaCartridge::load(vec![0; 0x200]);
+            let mut bus = GbaBus::new(cart);
+            let src = 0x0200_3500;
+            let dst = 0x0200_3600;
+            let code = 0x0200_3700;
+            let words = [
+                0x5B5F_530E,
+                0x3A5B_4B1F,
+                0x3D27_210F,
+                0x28A3_30E5,
+            ];
+
+            for (index, word) in words.iter().enumerate() {
+                bus.write32(src + (index as u32) * 4, *word);
+            }
+
+            cpu.regs[0] = src;
+            cpu.regs[1] = dst;
+            cpu.regs[15] = code;
+            cpu.cpsr |= 1 << 5;
+            bus.write16(code, 0xC83C);
+            bus.write16(code + 2, 0xC13C);
+
+            cpu.step(&mut bus);
+            cpu.step(&mut bus);
+
+            for (index, word) in words.iter().enumerate() {
+                assert_eq!(bus.read32(dst + (index as u32) * 4), *word);
+            }
+            assert_eq!(cpu.regs[0], src + 16);
+            assert_eq!(cpu.regs[1], dst + 16);
+        }
     }
 
     // ─── Timer Tests ───────────────────────────────────────
@@ -490,7 +809,7 @@ mod tests {
             // Enable with IRQ, prescaler 1
             t.write(0x102, 0xC0); // enabled + irq
             // Counter should overflow after 1 tick
-            let irqs = t.tick(2);
+            let (irqs, _) = t.tick(2);
             assert!(irqs != 0);
         }
 
@@ -648,6 +967,15 @@ mod tests {
     mod cartridge {
         use gbrust::cartridge::{CartridgeType, GbcCartridge, GbaCartridge, GbaBackupType};
         use gbrust::cartridge::mbc::{Mbc, MbcType};
+        use gbrust::cpu::arm7tdmi::Arm7Bus;
+        use gbrust::memory::gba_bus::GbaBus;
+
+        fn make_gba_eeprom_cart() -> GbaCartridge {
+            let mut rom = vec![0u8; 0x100000];
+            let sig = b"EEPROM_V";
+            rom[0x1000..0x1008].copy_from_slice(sig);
+            GbaCartridge::load(rom)
+        }
 
         #[test]
         fn gbc_cartridge_load() {
@@ -724,6 +1052,95 @@ mod tests {
             let cart = GbaCartridge::load(rom);
             assert_eq!(cart.backup_type, GbaBackupType::Sram);
         }
+
+        #[test]
+        fn gba_backup_detection_eeprom() {
+            let cart = make_gba_eeprom_cart();
+            assert_eq!(cart.backup_type, GbaBackupType::Eeprom);
+        }
+
+        #[test]
+        fn gba_eeprom_dma_detects_addr_length() {
+            let mut cart = make_gba_eeprom_cart();
+            cart.notify_eeprom_dma(17);
+            assert_eq!(cart.eeprom_addr_len, 14);
+            cart.notify_eeprom_dma(9);
+            assert_eq!(cart.eeprom_addr_len, 6);
+        }
+
+        #[test]
+        fn gba_eeprom_write_and_read_roundtrip_with_leading_zero_bit() {
+            let mut cart = make_gba_eeprom_cart();
+            cart.notify_eeprom_dma(73);
+            let address = 0b000011u16;
+            let data = 0x0123_4567_89AB_CDEFu64;
+
+            for bit in [1u8, 0u8] {
+                cart.eeprom_write(bit);
+            }
+            for shift in (0..cart.eeprom_addr_len).rev() {
+                cart.eeprom_write(((address >> shift) & 1) as u8);
+            }
+            for shift in (0..64).rev() {
+                cart.eeprom_write(((data >> shift) & 1) as u8);
+            }
+            cart.eeprom_write(0);
+
+            let byte_addr = address as usize * 8;
+            assert_eq!(&cart.eeprom[byte_addr..byte_addr + 8], &data.to_be_bytes());
+
+            for bit in [1u8, 1u8] {
+                cart.eeprom_write(bit);
+            }
+            for shift in (0..cart.eeprom_addr_len).rev() {
+                cart.eeprom_write(((address >> shift) & 1) as u8);
+            }
+            cart.eeprom_write(0);
+
+            let mut bits = Vec::new();
+            for _ in 0..68 {
+                bits.push(cart.eeprom_read());
+                cart.eeprom_read_advance();
+            }
+
+            assert!(bits[..4].iter().all(|&bit| bit == 0));
+            for (idx, expected) in (0..64).rev().map(|shift| ((data >> shift) & 1) as u8).enumerate() {
+                assert_eq!(bits[idx + 4], expected);
+            }
+        }
+
+        #[test]
+        fn gba_eeprom_cpu_halfword_reads_advance_serial_bits() {
+            let mut cart = make_gba_eeprom_cart();
+            cart.notify_eeprom_dma(73);
+            let address = 0b000001u16;
+            let data = 0x8000_0000_0000_0000u64;
+
+            for bit in [1u8, 0u8] {
+                cart.eeprom_write(bit);
+            }
+            for shift in (0..cart.eeprom_addr_len).rev() {
+                cart.eeprom_write(((address >> shift) & 1) as u8);
+            }
+            for shift in (0..64).rev() {
+                cart.eeprom_write(((data >> shift) & 1) as u8);
+            }
+            cart.eeprom_write(0);
+
+            for bit in [1u8, 1u8] {
+                cart.eeprom_write(bit);
+            }
+            for shift in (0..cart.eeprom_addr_len).rev() {
+                cart.eeprom_write(((address >> shift) & 1) as u8);
+            }
+            cart.eeprom_write(0);
+
+            let mut bus = GbaBus::new(cart);
+            for _ in 0..4 {
+                assert_eq!(bus.read16(0x0D00_0000) & 1, 0);
+            }
+            assert_eq!(bus.read16(0x0D00_0000) & 1, 1);
+        }
     }
 
     // ─── PPU Tests ─────────────────────────────────────────
@@ -790,7 +1207,7 @@ mod tests {
     // ─── APU Tests ─────────────────────────────────────────
 
     mod apu {
-        use gbrust::apu::gbc_apu::{GbcApu, SquareChannel, NoiseChannel};
+        use gbrust::apu::gbc_apu::{GbcApu, NoiseChannel, SquareChannel, WaveChannel};
         use gbrust::apu::gba_apu::GbaApu;
 
         #[test]
@@ -835,6 +1252,30 @@ mod tests {
             assert!(ch.enabled);
             assert_eq!(ch.volume, 8);
             assert_eq!(ch.lfsr, 0x7FFF);
+        }
+
+        #[test]
+        fn wave_channel_muted_output_is_silent() {
+            let mut ch = WaveChannel::new();
+            ch.enabled = true;
+            ch.dac_enabled = true;
+            ch.volume_code = 0;
+            ch.sample_buffer = 15;
+            assert_eq!(ch.output(), 0.0);
+        }
+
+        #[test]
+        fn wave_channel_output_is_centered_before_scaling() {
+            let mut ch = WaveChannel::new();
+            ch.enabled = true;
+            ch.dac_enabled = true;
+            ch.volume_code = 2;
+
+            ch.sample_buffer = 15;
+            assert!((ch.output() - 0.5).abs() < 1e-6);
+
+            ch.sample_buffer = 0;
+            assert!((ch.output() + 0.5).abs() < 1e-6);
         }
 
         #[test]

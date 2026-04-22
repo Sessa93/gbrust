@@ -1,6 +1,6 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -20,6 +20,8 @@ enum Emulator {
 
 /// Target frame duration: GBC and GBA both run at ~59.7275 Hz.
 const FRAME_DURATION: Duration = Duration::from_nanos(16_742_706);
+const MAX_AUDIO_BUFFER_SAMPLES: usize = 8192;
+const MAX_CATCH_UP_FRAMES: u32 = 4;
 
 pub struct EmuApp {
     emu: Emulator,
@@ -28,15 +30,18 @@ pub struct EmuApp {
     screen_width: usize,
     screen_height: usize,
     audio_stream: Option<AudioStream>,
+    volume: f32,
     save_slot: u8,
     status_msg: String,
     paused: bool,
     last_frame_time: Instant,
+    frame_accumulator: Duration,
 }
 
 struct AudioStream {
     _stream: cpal::Stream,
-    buffer: Arc<Mutex<Vec<f32>>>,
+    buffer: Arc<Mutex<VecDeque<f32>>>,
+    volume: Arc<Mutex<f32>>,
 }
 
 // cpal::Stream is not Send on some platforms, but we only use it from the main thread
@@ -52,11 +57,18 @@ impl EmuApp {
             screen_width: 240,
             screen_height: 160,
             audio_stream: None,
+            volume: 0.5,
             save_slot: 1,
             status_msg: "No ROM loaded. File -> Open ROM".to_string(),
             paused: false,
             last_frame_time: Instant::now(),
+            frame_accumulator: Duration::ZERO,
         }
+    }
+
+    fn reset_timing(&mut self) {
+        self.last_frame_time = Instant::now();
+        self.frame_accumulator = Duration::ZERO;
     }
 
     fn load_rom(&mut self, path: PathBuf) {
@@ -106,6 +118,7 @@ impl EmuApp {
         self.rom_path = Some(path);
         self.texture = None;
         self.setup_audio();
+        self.reset_timing();
     }
 
     fn setup_audio(&mut self) {
@@ -126,20 +139,24 @@ impl EmuApp {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_AUDIO_BUFFER_SAMPLES)));
         let buf_clone = buffer.clone();
+        let volume = Arc::new(Mutex::new(self.volume));
+        let vol_clone = volume.clone();
 
         let stream = device
             .build_output_stream(
                 &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                {
+                    let mut last_sample = 0.0f32;
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut buf = buf_clone.lock().unwrap();
+                    let volume = *vol_clone.lock().unwrap();
                     for sample in data.iter_mut() {
-                        *sample = if !buf.is_empty() {
-                            buf.remove(0)
-                        } else {
-                            0.0
-                        };
+                        let next = buf.pop_front().unwrap_or(last_sample);
+                        last_sample = next;
+                        *sample = next * volume;
+                    }
                     }
                 },
                 |err| log::error!("Audio stream error: {}", err),
@@ -154,6 +171,7 @@ impl EmuApp {
         self.audio_stream = stream.map(|s| AudioStream {
             _stream: s,
             buffer,
+            volume,
         });
     }
 
@@ -225,6 +243,7 @@ impl EmuApp {
                 Emulator::Gbc(_) => match save::load_gbc_state(path, self.save_slot) {
                     Ok(emu) => {
                         self.emu = Emulator::Gbc(emu);
+                        self.reset_timing();
                         self.status_msg =
                             format!("State loaded from slot {}", self.save_slot);
                     }
@@ -233,6 +252,7 @@ impl EmuApp {
                 Emulator::Gba(_) => match save::load_gba_state(path, self.save_slot) {
                     Ok(emu) => {
                         self.emu = Emulator::Gba(emu);
+                        self.reset_timing();
                         self.status_msg =
                             format!("State loaded from slot {}", self.save_slot);
                     }
@@ -306,6 +326,17 @@ impl eframe::App for EmuApp {
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status_msg);
+                ui.separator();
+                ui.add(
+                    egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                        .text("Volume")
+                        .clamping(egui::SliderClamping::Always),
+                );
+                if let Some(ref audio) = self.audio_stream {
+                    if let Ok(mut volume) = audio.volume.lock() {
+                        *volume = self.volume;
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label("Z/X=A/B  Enter=Start  Arrows=D-Pad  A/S=L/R");
                 });
@@ -315,37 +346,47 @@ impl eframe::App for EmuApp {
         // Handle input
         self.handle_input(ctx);
 
-        // Run emulator frame with timing control
+        // Run emulator frames with accumulator-based timing so short UI delays do not
+        // permanently slow the emulation and audio cadence.
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_frame_time);
-        let should_run = elapsed >= FRAME_DURATION;
+        self.last_frame_time = now;
 
-        if !self.paused && should_run {
-            self.last_frame_time = now;
+        if self.paused || matches!(self.emu, Emulator::None) {
+            self.frame_accumulator = Duration::ZERO;
+        } else {
+            let max_accumulator = FRAME_DURATION
+                .checked_mul(MAX_CATCH_UP_FRAMES)
+                .unwrap_or(FRAME_DURATION);
+            self.frame_accumulator = (self.frame_accumulator + elapsed).min(max_accumulator);
 
-            let framebuffer: Vec<u32> = match &mut self.emu {
-                Emulator::Gbc(emu) => emu.run_frame().to_vec(),
-                Emulator::Gba(emu) => emu.run_frame().to_vec(),
-                Emulator::None => vec![],
-            };
+            let mut latest_framebuffer: Option<Vec<u32>> = None;
+            let mut frames_run = 0;
+            while self.frame_accumulator >= FRAME_DURATION && frames_run < MAX_CATCH_UP_FRAMES {
+                self.frame_accumulator -= FRAME_DURATION;
+                frames_run += 1;
 
-            // Push audio
-            if let Some(ref audio) = self.audio_stream {
-                let samples = match &mut self.emu {
-                    Emulator::Gbc(emu) => emu.audio_buffer(),
-                    Emulator::Gba(emu) => emu.audio_buffer(),
-                    Emulator::None => vec![],
+                let (framebuffer, samples) = match &mut self.emu {
+                    Emulator::Gbc(emu) => (emu.run_frame().to_vec(), emu.audio_buffer()),
+                    Emulator::Gba(emu) => (emu.run_frame().to_vec(), emu.audio_buffer()),
+                    Emulator::None => (vec![], vec![]),
                 };
-                if let Ok(mut buf) = audio.buffer.lock() {
-                    // Keep buffer from growing too large
-                    if buf.len() < 8192 {
-                        buf.extend_from_slice(&samples);
+
+                if let Some(ref audio) = self.audio_stream {
+                    if let Ok(mut buf) = audio.buffer.lock() {
+                        buf.extend(samples);
+                        while buf.len() > MAX_AUDIO_BUFFER_SAMPLES {
+                            buf.pop_front();
+                        }
                     }
+                }
+
+                if !framebuffer.is_empty() {
+                    latest_framebuffer = Some(framebuffer);
                 }
             }
 
-            // Update texture
-            if !framebuffer.is_empty() {
+            if let Some(framebuffer) = latest_framebuffer {
                 let pixels: Vec<egui::Color32> = framebuffer
                     .iter()
                     .map(|&argb| {
@@ -420,11 +461,10 @@ impl eframe::App for EmuApp {
 
         // Schedule next repaint at the right time for ~59.73 Hz
         if !matches!(self.emu, Emulator::None) && !self.paused {
-            let since_frame = Instant::now().duration_since(self.last_frame_time);
-            if since_frame < FRAME_DURATION {
-                ctx.request_repaint_after(FRAME_DURATION - since_frame);
-            } else {
+            if self.frame_accumulator >= FRAME_DURATION {
                 ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(FRAME_DURATION - self.frame_accumulator);
             }
         }
     }

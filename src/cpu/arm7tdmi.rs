@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::f64::consts::PI;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CpuMode {
@@ -39,8 +40,8 @@ impl CpuMode {
 
 pub trait Arm7Bus {
     fn read8(&self, addr: u32) -> u8;
-    fn read16(&self, addr: u32) -> u16;
-    fn read32(&self, addr: u32) -> u32;
+    fn read16(&mut self, addr: u32) -> u16;
+    fn read32(&mut self, addr: u32) -> u32;
     fn write8(&mut self, addr: u32, val: u8);
     fn write16(&mut self, addr: u32, val: u16);
     fn write32(&mut self, addr: u32, val: u32);
@@ -543,8 +544,12 @@ impl Arm7Tdmi {
         if rd == 15 && !matches!(opcode, 0x8 | 0x9 | 0xA | 0xB) {
             self.regs[15] = result;
         }
+        // S flag with Rd=PC: restore CPSR from SPSR and switch register banks
         if rd == 15 && set_flags {
-            self.cpsr = self.spsr[self.current_mode().bank_index()];
+            let new_cpsr = self.spsr[self.current_mode().bank_index()];
+            let new_mode = CpuMode::from_bits(new_cpsr);
+            self.switch_mode(new_mode);
+            self.cpsr = new_cpsr;
         }
 
         1
@@ -735,8 +740,6 @@ impl Arm7Tdmi {
         let rn = ((instr >> 16) & 0xF) as usize;
         let rlist = instr & 0xFFFF;
 
-        let _ = psr; // PSR bit handling simplified
-
         let count = rlist.count_ones();
         let base = self.regs[rn];
 
@@ -775,6 +778,14 @@ impl Arm7Tdmi {
             } else {
                 base.wrapping_sub(count * 4)
             };
+        }
+
+        // PSR flag with LDM + PC in list: restore CPSR from SPSR and switch register banks
+        if psr && load && (rlist & (1 << 15) != 0) {
+            let new_cpsr = self.spsr[self.current_mode().bank_index()];
+            let new_mode = CpuMode::from_bits(new_cpsr);
+            self.switch_mode(new_mode);
+            self.cpsr = new_cpsr;
         }
 
         count + if load { 2 } else { 1 }
@@ -1168,7 +1179,7 @@ impl Arm7Tdmi {
         1
     }
 
-    fn thumb_pc_relative_load(&mut self, instr: u32, bus: &impl Arm7Bus) -> u32 {
+    fn thumb_pc_relative_load(&mut self, instr: u32, bus: &mut impl Arm7Bus) -> u32 {
         let rd = ((instr >> 8) & 7) as usize;
         let offset = (instr & 0xFF) << 2;
         let addr = (self.regs[15].wrapping_add(2) & !2).wrapping_add(offset);
@@ -1400,6 +1411,10 @@ impl Arm7Tdmi {
 
     fn handle_swi(&mut self, num: u32, bus: &mut impl Arm7Bus) {
         match num {
+            0x01 => {
+                // RegisterRamReset
+                self.swi_register_ram_reset(bus);
+            }
             0x02 => {
                 // Halt
                 self.halted = true;
@@ -1474,9 +1489,21 @@ impl Arm7Tdmi {
                     bus.write32(dst.wrapping_add(i * 4), val);
                 }
             }
-            0x11 | 0x12 => {
-                // LZ77 decompress
-                self.swi_lz77_decompress(bus);
+            0x0E => {
+                // BgAffineSet
+                self.swi_bg_affine_set(bus);
+            }
+            0x0F => {
+                // ObjAffineSet
+                self.swi_obj_affine_set(bus);
+            }
+            0x11 => {
+                // LZ77UnCompWram
+                self.swi_lz77_decompress_wram(bus);
+            }
+            0x12 => {
+                // LZ77UnCompVram
+                self.swi_lz77_decompress_vram(bus);
             }
             _ => {
                 log::warn!("Unimplemented SWI: 0x{:02X}", num);
@@ -1484,7 +1511,75 @@ impl Arm7Tdmi {
         }
     }
 
-    fn swi_lz77_decompress(&mut self, bus: &mut impl Arm7Bus) {
+    fn bios_sin_cos(angle: u8) -> (i32, i32) {
+        let radians = (angle as f64) * (2.0 * PI / 256.0);
+        let sin = (radians.sin() * 4096.0).round() as i32;
+        let cos = (radians.cos() * 4096.0).round() as i32;
+        (sin, cos)
+    }
+
+    fn swi_bg_affine_set(&mut self, bus: &mut impl Arm7Bus) {
+        let src = self.regs[0];
+        let dst = self.regs[1];
+        let count = self.regs[2];
+
+        for i in 0..count {
+            let src_entry = src.wrapping_add(i * 20);
+            let dst_entry = dst.wrapping_add(i * 16);
+
+            let tex_x = bus.read32(src_entry) as i32;
+            let tex_y = bus.read32(src_entry.wrapping_add(4)) as i32;
+            let scr_x = bus.read16(src_entry.wrapping_add(8)) as i16 as i32;
+            let scr_y = bus.read16(src_entry.wrapping_add(10)) as i16 as i32;
+            let scale_x = bus.read16(src_entry.wrapping_add(12)) as i16 as i32;
+            let scale_y = bus.read16(src_entry.wrapping_add(14)) as i16 as i32;
+            let angle = (bus.read16(src_entry.wrapping_add(16)) >> 8) as u8;
+
+            let (sin, cos) = Self::bios_sin_cos(angle);
+            let pa = ((scale_x * cos) >> 12) as i16;
+            let pb = ((-(scale_x * sin)) >> 12) as i16;
+            let pc = ((scale_y * sin) >> 12) as i16;
+            let pd = ((scale_y * cos) >> 12) as i16;
+            let dx = tex_x - (pa as i32 * scr_x + pb as i32 * scr_y);
+            let dy = tex_y - (pc as i32 * scr_x + pd as i32 * scr_y);
+
+            bus.write16(dst_entry, pa as u16);
+            bus.write16(dst_entry.wrapping_add(2), pb as u16);
+            bus.write16(dst_entry.wrapping_add(4), pc as u16);
+            bus.write16(dst_entry.wrapping_add(6), pd as u16);
+            bus.write32(dst_entry.wrapping_add(8), dx as u32);
+            bus.write32(dst_entry.wrapping_add(12), dy as u32);
+        }
+    }
+
+    fn swi_obj_affine_set(&mut self, bus: &mut impl Arm7Bus) {
+        let src = self.regs[0];
+        let dst = self.regs[1];
+        let count = self.regs[2];
+        let offset = self.regs[3];
+
+        for i in 0..count {
+            let src_entry = src.wrapping_add(i * 8);
+            let dst_entry = dst.wrapping_add(i * offset * 4);
+
+            let scale_x = bus.read16(src_entry) as i16 as i32;
+            let scale_y = bus.read16(src_entry.wrapping_add(2)) as i16 as i32;
+            let angle = (bus.read16(src_entry.wrapping_add(4)) >> 8) as u8;
+
+            let (sin, cos) = Self::bios_sin_cos(angle);
+            let pa = ((scale_x * cos) >> 12) as i16;
+            let pb = ((-(scale_x * sin)) >> 12) as i16;
+            let pc = ((scale_y * sin) >> 12) as i16;
+            let pd = ((scale_y * cos) >> 12) as i16;
+
+            bus.write16(dst_entry, pa as u16);
+            bus.write16(dst_entry.wrapping_add(offset), pb as u16);
+            bus.write16(dst_entry.wrapping_add(offset * 2), pc as u16);
+            bus.write16(dst_entry.wrapping_add(offset * 3), pd as u16);
+        }
+    }
+
+    fn swi_lz77_decompress_wram(&mut self, bus: &mut impl Arm7Bus) {
         let src = self.regs[0];
         let dst = self.regs[1];
         let header = bus.read32(src);
@@ -1521,6 +1616,117 @@ impl Arm7Tdmi {
                     dst_pos += 1;
                     remaining -= 1;
                 }
+            }
+        }
+    }
+
+    fn swi_lz77_decompress_vram(&mut self, bus: &mut impl Arm7Bus) {
+        let src = self.regs[0];
+        let dst = self.regs[1];
+        let header = bus.read32(src);
+        let decompressed_size = header >> 8;
+
+        let mut src_pos = src + 4;
+        let mut out: Vec<u8> = Vec::with_capacity(decompressed_size as usize);
+
+        while (out.len() as u32) < decompressed_size {
+            let flags = bus.read8(src_pos);
+            src_pos += 1;
+
+            for bit in (0..8).rev() {
+                if (out.len() as u32) >= decompressed_size {
+                    break;
+                }
+                if flags & (1 << bit) != 0 {
+                    let b1 = bus.read8(src_pos) as u32;
+                    let b2 = bus.read8(src_pos + 1) as u32;
+                    src_pos += 2;
+                    let length = (b1 >> 4) + 3;
+                    let disp = ((b1 & 0xF) << 8 | b2) + 1;
+                    for _ in 0..length {
+                        if (out.len() as u32) >= decompressed_size {
+                            break;
+                        }
+                        let back = out.len().saturating_sub(disp as usize);
+                        let val = out[back];
+                        out.push(val);
+                    }
+                } else {
+                    let val = bus.read8(src_pos);
+                    src_pos += 1;
+                    out.push(val);
+                }
+            }
+        }
+
+        // VRAM variant writes 16-bit units.
+        let mut dst_pos = dst;
+        let mut i = 0usize;
+        while i < out.len() {
+            let lo = out[i] as u16;
+            let hi = if i + 1 < out.len() { out[i + 1] as u16 } else { 0 };
+            bus.write16(dst_pos, lo | (hi << 8));
+            dst_pos = dst_pos.wrapping_add(2);
+            i += 2;
+        }
+    }
+
+    fn swi_register_ram_reset(&mut self, bus: &mut impl Arm7Bus) {
+        let flags = self.regs[0] as u8;
+
+        if flags & 0x01 != 0 {
+            for addr in 0x0200_0000..=0x0203_FFFF {
+                bus.write8(addr, 0);
+            }
+        }
+        if flags & 0x02 != 0 {
+            // BIOS keeps the top 0x200 bytes of IWRAM intact.
+            for addr in 0x0300_0000..=0x0300_7DFF {
+                bus.write8(addr, 0);
+            }
+        }
+        if flags & 0x04 != 0 {
+            for addr in 0x0500_0000..=0x0500_03FF {
+                bus.write8(addr, 0);
+            }
+        }
+        if flags & 0x08 != 0 {
+            for addr in 0x0600_0000..=0x0601_7FFF {
+                bus.write8(addr, 0);
+            }
+        }
+        if flags & 0x10 != 0 {
+            for addr in 0x0700_0000..=0x0700_03FF {
+                bus.write8(addr, 0);
+            }
+        }
+        if flags & 0x20 != 0 {
+            for addr in 0x0400_0120..=0x0400_012A {
+                bus.write8(addr, 0);
+            }
+            bus.write8(0x0400_0134, 0);
+            bus.write8(0x0400_0135, 0);
+        }
+        if flags & 0x40 != 0 {
+            for addr in 0x0400_0060..=0x0400_00A7 {
+                bus.write8(addr, 0);
+            }
+            // Restore the GBA default audio bias.
+            bus.write8(0x0400_0088, 0x00);
+            bus.write8(0x0400_0089, 0x02);
+        }
+        if flags & 0x80 != 0 {
+            for addr in 0x0400_0000..=0x0400_0055 {
+                bus.write8(addr, 0);
+            }
+            for addr in 0x0400_00B0..=0x0400_00DF {
+                bus.write8(addr, 0);
+            }
+            for addr in 0x0400_0100..=0x0400_0111 {
+                bus.write8(addr, 0);
+            }
+            for addr in 0x0400_0200..=0x0400_020B {
+                bus.write8(addr, 0);
             }
         }
     }

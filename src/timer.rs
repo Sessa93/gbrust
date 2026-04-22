@@ -118,8 +118,9 @@ impl GbaTimers {
         }
     }
 
-    pub fn tick(&mut self, cycles: u32) -> u16 {
+    pub fn tick(&mut self, cycles: u32) -> (u16, u8) {
         let mut irqs = 0u16;
+        let mut overflows_mask = 0u8;
         let mut overflow = [false; 4];
 
         for i in 0..4 {
@@ -133,6 +134,7 @@ impl GbaTimers {
                     if overflowed {
                         self.timers[i].counter = self.timers[i].reload;
                         overflow[i] = true;
+                        overflows_mask |= 1 << i;
                         if self.timers[i].irq_enabled {
                             irqs |= 1 << (3 + i);
                         }
@@ -152,6 +154,7 @@ impl GbaTimers {
                 if overflowed {
                     self.timers[i].counter = self.timers[i].reload;
                     overflow[i] = true;
+                    overflows_mask |= 1 << i;
                     if self.timers[i].irq_enabled {
                         irqs |= 1 << (3 + i);
                     }
@@ -161,7 +164,7 @@ impl GbaTimers {
             }
         }
 
-        irqs
+        (irqs, overflows_mask)
     }
 
     pub fn read(&self, offset: u32) -> u8 {

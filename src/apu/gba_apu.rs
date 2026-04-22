@@ -26,6 +26,7 @@ pub struct GbaApu {
     // SOUNDBIAS
     pub soundbias: u16,
 
+    pub psg_cycle_accum: u32,
     pub frame_sequencer: u32,
     pub frame_step: u8,
     pub sample_counter: u32,
@@ -49,6 +50,7 @@ impl GbaApu {
             fifo_a_sample: 0,
             fifo_b_sample: 0,
             soundbias: 0x200,
+            psg_cycle_accum: 0,
             frame_sequencer: 0,
             frame_step: 0,
             sample_counter: 0,
@@ -62,24 +64,27 @@ impl GbaApu {
             return;
         }
 
-        for _ in 0..cycles {
+        // The legacy PSG runs at 4.194304 MHz on GBA, while the CPU runs at 16.777216 MHz.
+        self.psg_cycle_accum += cycles;
+        while self.psg_cycle_accum >= 4 {
+            self.psg_cycle_accum -= 4;
             self.ch1.tick();
             self.ch2.tick();
             self.ch3.tick();
             self.ch4.tick();
+        }
 
-            self.frame_sequencer += 1;
-            if self.frame_sequencer >= 8192 {
-                self.frame_sequencer = 0;
-                self.clock_frame_sequencer();
-            }
+        self.frame_sequencer += cycles;
+        while self.frame_sequencer >= 32_768 {
+            self.frame_sequencer -= 32_768;
+            self.clock_frame_sequencer();
+        }
 
-            // Downsample from GBA clock (16.78 MHz)
-            self.sample_counter += self.sample_rate;
-            if self.sample_counter >= 16_777_216 {
-                self.sample_counter -= 16_777_216;
-                self.generate_sample();
-            }
+        // Downsample from the 16.78 MHz master clock.
+        self.sample_counter = self.sample_counter.wrapping_add(cycles.saturating_mul(self.sample_rate));
+        while self.sample_counter >= 16_777_216 {
+            self.sample_counter -= 16_777_216;
+            self.generate_sample();
         }
     }
 
@@ -332,8 +337,14 @@ impl GbaApu {
             0x083 => {
                 self.soundcnt_h = (self.soundcnt_h & 0x00FF) | ((val as u16) << 8);
                 // Reset FIFOs if bits set
-                if val & 0x08 != 0 { self.fifo_a.clear(); }
-                if val & 0x80 != 0 { self.fifo_b.clear(); }
+                if val & 0x08 != 0 {
+                    self.fifo_a.clear();
+                    self.fifo_a_sample = 0;
+                }
+                if val & 0x80 != 0 {
+                    self.fifo_b.clear();
+                    self.fifo_b_sample = 0;
+                }
             }
             0x084 => {
                 let was_enabled = self.enabled;

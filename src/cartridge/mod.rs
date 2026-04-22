@@ -160,6 +160,7 @@ pub struct GbaCartridge {
     pub eeprom_bits_read: u8,
     pub eeprom_read_buffer: u64,
     pub eeprom_addr_len: u8, // 6 or 14 bits
+    eeprom_command: EepromCommand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +172,13 @@ pub enum EepromState {
     WritingFinish,
     ReadReady,
     ReadingData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum EepromCommand {
+    None,
+    Read,
+    Write,
 }
 
 impl GbaCartridge {
@@ -191,8 +199,6 @@ impl GbaCartridge {
             GbaBackupType::None => (vec![0xFF; 0x8000], vec![], vec![]),
         };
 
-        let eeprom_addr_len = if data.len() > 16 * 1024 * 1024 { 14 } else { 6 };
-
         Self {
             rom: data,
             sram,
@@ -210,7 +216,9 @@ impl GbaCartridge {
             eeprom_address: 0,
             eeprom_bits_read: 0,
             eeprom_read_buffer: 0,
-            eeprom_addr_len,
+            // The actual EEPROM size is determined from DMA transfer lengths.
+            eeprom_addr_len: 6,
+            eeprom_command: EepromCommand::None,
         }
     }
 
@@ -226,6 +234,18 @@ impl GbaCartridge {
             GbaBackupType::Eeprom
         } else {
             GbaBackupType::Sram // Default fallback
+        }
+    }
+
+    pub fn notify_eeprom_dma(&mut self, transfer_count: u32) {
+        if self.backup_type != GbaBackupType::Eeprom {
+            return;
+        }
+
+        match transfer_count {
+            9 | 73 => self.eeprom_addr_len = 6,
+            17 | 81 => self.eeprom_addr_len = 14,
+            _ => {}
         }
     }
 
@@ -351,6 +371,7 @@ impl GbaCartridge {
             self.eeprom_bits_read += 1;
             if self.eeprom_bits_read >= 68 {
                 self.eeprom_state = EepromState::Idle;
+                self.eeprom_command = EepromCommand::None;
             }
         }
     }
@@ -362,6 +383,7 @@ impl GbaCartridge {
             EepromState::Idle => {
                 self.eeprom_buffer = bit as u64;
                 self.eeprom_bits_written = 1;
+                self.eeprom_command = EepromCommand::None;
                 self.eeprom_state = EepromState::ReadingCommand;
             }
             EepromState::ReadingCommand => {
@@ -375,13 +397,16 @@ impl GbaCartridge {
                     match cmd {
                         3 => {
                             // Read command (11)
+                            self.eeprom_command = EepromCommand::Read;
                             self.eeprom_state = EepromState::ReadingAddress;
                         }
                         2 => {
                             // Write command (10)
+                            self.eeprom_command = EepromCommand::Write;
                             self.eeprom_state = EepromState::ReadingAddress;
                         }
                         _ => {
+                            self.eeprom_command = EepromCommand::None;
                             self.eeprom_state = EepromState::Idle;
                         }
                     }
@@ -392,7 +417,14 @@ impl GbaCartridge {
                 self.eeprom_bits_written += 1;
                 if self.eeprom_bits_written >= self.eeprom_addr_len {
                     self.eeprom_bits_written = 0;
-                    self.eeprom_state = EepromState::ReadReady;
+                    self.eeprom_state = match self.eeprom_command {
+                        EepromCommand::Read => EepromState::ReadReady,
+                        EepromCommand::Write => {
+                            self.eeprom_buffer = 0;
+                            EepromState::WritingData
+                        }
+                        EepromCommand::None => EepromState::Idle,
+                    };
                 }
             }
             EepromState::ReadReady => {
@@ -412,11 +444,6 @@ impl GbaCartridge {
                     }
                     self.eeprom_bits_read = 0;
                     self.eeprom_state = EepromState::ReadingData;
-                } else {
-                    // Write: start collecting 64 data bits
-                    self.eeprom_buffer = bit as u64;
-                    self.eeprom_bits_written = 1;
-                    self.eeprom_state = EepromState::WritingData;
                 }
             }
             EepromState::WritingData => {
@@ -438,10 +465,12 @@ impl GbaCartridge {
             EepromState::WritingFinish => {
                 // End bit after write
                 self.eeprom_state = EepromState::Idle;
+                self.eeprom_command = EepromCommand::None;
             }
             EepromState::ReadingData => {
                 // Shouldn't write during read, go back to idle
                 self.eeprom_state = EepromState::Idle;
+                self.eeprom_command = EepromCommand::None;
             }
         }
     }

@@ -6,6 +6,11 @@ pub const SCREEN_H: usize = 160;
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GbaPpu {
     pub framebuffer: Vec<u32>,
+    pub color_buffer: Vec<u16>,
+    pub priority_buffer: Vec<u8>,
+    pub layer_buffer: Vec<u8>,
+    pub window_flags_scanline: Vec<u8>,
+    pub obj_window_scanline: Vec<bool>,
     pub vram: Vec<u8>,       // 96KB
     pub palette: Vec<u8>,    // 1KB
     pub oam: Vec<u8>,        // 1KB
@@ -51,6 +56,11 @@ impl GbaPpu {
     pub fn new() -> Self {
         Self {
             framebuffer: vec![0xFF_FF_FF_FF; SCREEN_W * SCREEN_H],
+            color_buffer: vec![0x7FFF; SCREEN_W * SCREEN_H],
+            priority_buffer: vec![4; SCREEN_W * SCREEN_H],
+            layer_buffer: vec![5; SCREEN_W * SCREEN_H],
+            window_flags_scanline: vec![0x3F; SCREEN_W],
+            obj_window_scanline: vec![false; SCREEN_W],
             vram: vec![0; 0x18000],
             palette: vec![0; 0x400],
             oam: vec![0; 0x400],
@@ -156,13 +166,41 @@ impl GbaPpu {
             return;
         }
 
-        let mode = self.dispcnt & 0x07;
         let row_start = line * SCREEN_W;
 
+        // Forced blank (DISPCNT bit 7): output white
+        if self.dispcnt & 0x80 != 0 {
+            for (((px, raw), prio), layer) in self.framebuffer[row_start..row_start + SCREEN_W]
+                .iter_mut()
+                .zip(self.color_buffer[row_start..row_start + SCREEN_W].iter_mut())
+                .zip(self.priority_buffer[row_start..row_start + SCREEN_W].iter_mut())
+                .zip(self.layer_buffer[row_start..row_start + SCREEN_W].iter_mut())
+            {
+                *px = 0xFF_FF_FF_FF;
+                *raw = 0x7FFF;
+                *prio = 4;
+                *layer = 5;
+            }
+            return;
+        }
+
+        let mode = self.dispcnt & 0x07;
+
+        self.build_obj_window_scanline(line);
+        self.build_window_scanline(line);
+
         // Clear with backdrop color
-        let backdrop = self.palette_color(0);
-        for px in &mut self.framebuffer[row_start..row_start + SCREEN_W] {
-            *px = backdrop;
+        let backdrop = self.raw_palette_color(0);
+        for (((px, raw), prio), layer) in self.framebuffer[row_start..row_start + SCREEN_W]
+            .iter_mut()
+            .zip(self.color_buffer[row_start..row_start + SCREEN_W].iter_mut())
+            .zip(self.priority_buffer[row_start..row_start + SCREEN_W].iter_mut())
+            .zip(self.layer_buffer[row_start..row_start + SCREEN_W].iter_mut())
+        {
+            *px = Self::rgb555_to_argb(backdrop);
+            *raw = backdrop;
+            *prio = 4;
+            *layer = 5;
         }
 
         match mode {
@@ -182,43 +220,74 @@ impl GbaPpu {
     }
 
     fn render_mode0(&mut self, line: usize) {
-        // 4 text BGs
-        for bg in (0..4).rev() {
-            if self.dispcnt & (1 << (8 + bg)) != 0 {
-                self.render_text_bg(bg, line);
-            }
+        // Collect enabled BGs and sort by priority: higher number drawn first (behind),
+        // ties broken by higher BG index first (BG0 has highest priority among equals).
+        let mut layers: Vec<usize> = (0..4usize)
+            .filter(|&bg| self.dispcnt & (1 << (8 + bg)) != 0)
+            .collect();
+        layers.sort_by(|&a, &b| {
+            let pa = self.bgcnt[a] & 3;
+            let pb = self.bgcnt[b] & 3;
+            pb.cmp(&pa).then(b.cmp(&a))
+        });
+        for bg in layers {
+            self.render_text_bg(bg, line);
         }
     }
 
     fn render_mode1(&mut self, line: usize) {
-        // BG0, BG1 text; BG2 affine
-        if self.dispcnt & (1 << 10) != 0 {
-            self.render_affine_bg(0, line);
-        }
-        for bg in [1, 0] {
+        // BG0, BG1 text; BG2 affine — sorted by priority
+        // (bg_index, is_affine)
+        let mut layers: Vec<(usize, bool)> = Vec::new();
+        for bg in 0..2usize {
             if self.dispcnt & (1 << (8 + bg)) != 0 {
+                layers.push((bg, false));
+            }
+        }
+        if self.dispcnt & (1 << 10) != 0 {
+            layers.push((2, true));
+        }
+        layers.sort_by(|a, b| {
+            let pa = self.bgcnt[a.0] & 3;
+            let pb = self.bgcnt[b.0] & 3;
+            pb.cmp(&pa).then(b.0.cmp(&a.0))
+        });
+        for (bg, is_affine) in layers {
+            if is_affine {
+                self.render_affine_bg(0, line);
+            } else {
                 self.render_text_bg(bg, line);
             }
         }
     }
 
     fn render_mode2(&mut self, line: usize) {
-        // BG2, BG3 affine
-        for i in (0..2).rev() {
-            if self.dispcnt & (1 << (10 + i)) != 0 {
-                self.render_affine_bg(i, line);
-            }
+        // BG2, BG3 affine — sorted by priority
+        let mut layers: Vec<usize> = (0..2usize)
+            .filter(|&i| self.dispcnt & (1 << (10 + i)) != 0)
+            .collect();
+        layers.sort_by(|&a, &b| {
+            let pa = self.bgcnt[2 + a] & 3;
+            let pb = self.bgcnt[2 + b] & 3;
+            pb.cmp(&pa).then(b.cmp(&a))
+        });
+        for i in layers {
+            self.render_affine_bg(i, line);
         }
     }
 
     fn render_mode3(&mut self, line: usize) {
         // 240x160 16-bit color bitmap
         let row_start = line * SCREEN_W;
+        let priority = (self.bgcnt[2] & 3) as u8;
         for x in 0..SCREEN_W {
+            if !self.layer_enabled_at(2, x) {
+                continue;
+            }
             let offset = (line * SCREEN_W + x) * 2;
             if offset + 1 < self.vram.len() {
                 let color = (self.vram[offset] as u16) | ((self.vram[offset + 1] as u16) << 8);
-                self.framebuffer[row_start + x] = Self::rgb555_to_argb(color);
+                self.write_pixel(row_start + x, 2, priority, color, false);
             }
         }
     }
@@ -227,13 +296,16 @@ impl GbaPpu {
         // 240x160 8-bit indexed bitmap, 2 frames
         let frame_offset = if self.dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
         let row_start = line * SCREEN_W;
+        let priority = (self.bgcnt[2] & 3) as u8;
         for x in 0..SCREEN_W {
+            if !self.layer_enabled_at(2, x) {
+                continue;
+            }
             let offset = frame_offset + line * SCREEN_W + x;
             if offset < self.vram.len() {
                 let pal_idx = self.vram[offset];
-                if pal_idx != 0 {
-                    self.framebuffer[row_start + x] = self.palette_color(pal_idx as usize * 2);
-                }
+                let color = self.raw_palette_color(pal_idx as usize * 2);
+                self.write_pixel(row_start + x, 2, priority, color, false);
             }
         }
     }
@@ -243,17 +315,22 @@ impl GbaPpu {
         if line >= 128 { return; }
         let frame_offset = if self.dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
         let row_start = line * SCREEN_W;
+        let priority = (self.bgcnt[2] & 3) as u8;
         for x in 0..160 {
+            if !self.layer_enabled_at(2, x) {
+                continue;
+            }
             let offset = frame_offset + (line * 160 + x) * 2;
             if offset + 1 < self.vram.len() {
                 let color = (self.vram[offset] as u16) | ((self.vram[offset + 1] as u16) << 8);
-                self.framebuffer[row_start + x] = Self::rgb555_to_argb(color);
+                self.write_pixel(row_start + x, 2, priority, color, false);
             }
         }
     }
 
     fn render_text_bg(&mut self, bg: usize, line: usize) {
         let cnt = self.bgcnt[bg];
+        let priority = (cnt & 3) as u8;
         let char_base = ((cnt as usize >> 2) & 3) * 0x4000;
         let screen_base = ((cnt as usize >> 8) & 0x1F) * 0x800;
         let color_256 = cnt & 0x80 != 0;
@@ -275,6 +352,9 @@ impl GbaPpu {
         let row_start = line * SCREEN_W;
 
         for px in 0..SCREEN_W {
+            if !self.layer_enabled_at(bg, px) {
+                continue;
+            }
             let x = (px + scroll_x) % (map_w * 8);
             let tile_x = x / 8;
             let fine_x = x % 8;
@@ -303,23 +383,24 @@ impl GbaPpu {
                 if offset >= self.vram.len() { continue; }
                 let pal_idx = self.vram[offset];
                 if pal_idx == 0 { continue; }
-                self.palette_color(pal_idx as usize * 2)
+                self.raw_palette_color(pal_idx as usize * 2)
             } else {
                 let offset = char_base + tile_num * 32 + ty * 4 + tx / 2;
                 if offset >= self.vram.len() { continue; }
                 let byte = self.vram[offset];
                 let pal_idx = if tx & 1 == 0 { byte & 0xF } else { byte >> 4 };
                 if pal_idx == 0 { continue; }
-                self.palette_color((pal * 32 + pal_idx as usize * 2) as usize)
+                self.raw_palette_color((pal * 32 + pal_idx as usize * 2) as usize)
             };
 
-            self.framebuffer[row_start + px] = color;
+            self.write_pixel(row_start + px, bg as u8, priority, color, false);
         }
     }
 
     fn render_affine_bg(&mut self, idx: usize, line: usize) {
         let bg = idx + 2; // Affine BGs are BG2/BG3
         let cnt = self.bgcnt[bg];
+        let priority = (cnt & 3) as u8;
         let char_base = ((cnt as usize >> 2) & 3) * 0x4000;
         let screen_base = ((cnt as usize >> 8) & 0x1F) * 0x800;
         let wrap = cnt & 0x2000 != 0;
@@ -341,6 +422,9 @@ impl GbaPpu {
         let row_start = line * SCREEN_W;
 
         for px in 0..SCREEN_W {
+            if !self.layer_enabled_at(bg, px) {
+                continue;
+            }
             let tex_x = (ref_x + pa * px as i32) >> 8;
             let tex_y = (ref_y + pc * px as i32) >> 8;
 
@@ -368,7 +452,8 @@ impl GbaPpu {
             let pal_idx = self.vram[pixel_offset];
             if pal_idx == 0 { continue; }
 
-            self.framebuffer[row_start + px] = self.palette_color(pal_idx as usize * 2);
+            let color = self.raw_palette_color(pal_idx as usize * 2);
+            self.write_pixel(row_start + px, bg as u8, priority, color, false);
         }
     }
 
@@ -380,18 +465,27 @@ impl GbaPpu {
             let attr1 = (self.oam[base + 2] as u16) | ((self.oam[base + 3] as u16) << 8);
             let attr2 = (self.oam[base + 4] as u16) | ((self.oam[base + 5] as u16) << 8);
 
-            let obj_mode = (attr0 >> 8) & 3;
-            if obj_mode == 2 { continue; } // Hidden
+            let affine = attr0 & 0x0100 != 0;
+            let double_size_or_disable = attr0 & 0x0200 != 0;
+            let obj_mode = (attr0 >> 10) & 3;
+            if !affine && double_size_or_disable {
+                continue;
+            }
+            if obj_mode == 2 {
+                continue;
+            }
 
             let shape = (attr0 >> 14) & 3;
             let size = (attr1 >> 14) & 3;
 
             let (w, h) = Self::obj_size(shape, size);
+            let disp_w = if affine && double_size_or_disable { w * 2 } else { w };
+            let disp_h = if affine && double_size_or_disable { h * 2 } else { h };
 
             let y = (attr0 & 0xFF) as i32;
             let y = if y >= 160 { y - 256 } else { y };
 
-            if (line as i32) < y || (line as i32) >= y + h as i32 {
+            if (line as i32) < y || (line as i32) >= y + disp_h as i32 {
                 continue;
             }
 
@@ -399,31 +493,59 @@ impl GbaPpu {
             let x = if x >= 240 { x - 512 } else { x };
 
             let tile_num = (attr2 & 0x3FF) as usize;
+            let priority = ((attr2 >> 10) & 3) as u8;
             let palette_num = ((attr2 >> 12) & 0xF) as usize;
             let color_256 = attr0 & 0x2000 != 0;
-            let h_flip = attr1 & 0x1000 != 0 && obj_mode != 1;
-            let v_flip = attr1 & 0x2000 != 0 && obj_mode != 1;
-
-            let sprite_y = if v_flip {
-                (h - 1 - ((line as i32 - y) as usize))
-            } else {
-                (line as i32 - y) as usize
-            };
-
-            let tile_row = sprite_y / 8;
-            let fine_y = sprite_y % 8;
+            let h_flip = !affine && attr1 & 0x1000 != 0;
+            let v_flip = !affine && attr1 & 0x2000 != 0;
             let obj_mapping_1d = self.dispcnt & 0x40 != 0;
+            let affine_idx = ((attr1 >> 9) & 0x1F) as usize;
+            let (pa, pb, pc, pd) = if affine {
+                self.obj_affine_params(affine_idx)
+            } else {
+                (0x100, 0, 0, 0x100)
+            };
 
             let row_start = line * SCREEN_W;
 
-            for sprite_x in 0..w {
+            for sprite_x in 0..disp_w {
                 let screen_x = x + sprite_x as i32;
                 if screen_x < 0 || screen_x >= SCREEN_W as i32 { continue; }
+                if !self.obj_enabled_at(screen_x as usize) {
+                    continue;
+                }
 
-                let px = if h_flip { w - 1 - sprite_x } else { sprite_x };
+                if priority > self.priority_buffer[row_start + screen_x as usize] {
+                    continue;
+                }
 
-                let tile_col = px / 8;
-                let fine_x = px % 8;
+                let local_y = (line as i32 - y) as isize;
+                let local_x = sprite_x as isize;
+                let (src_x, src_y) = if affine {
+                    let center_x = disp_w as isize / 2;
+                    let center_y = disp_h as isize / 2;
+                    let dx = local_x - center_x;
+                    let dy = local_y - center_y;
+                    let src_x = ((pa as isize * dx + pb as isize * dy) >> 8) + (w as isize / 2);
+                    let src_y = ((pc as isize * dx + pd as isize * dy) >> 8) + (h as isize / 2);
+                    if src_x < 0 || src_y < 0 || src_x >= w as isize || src_y >= h as isize {
+                        continue;
+                    }
+                    (src_x as usize, src_y as usize)
+                } else {
+                    let src_y = if v_flip {
+                        h - 1 - local_y as usize
+                    } else {
+                        local_y as usize
+                    };
+                    let src_x = if h_flip { w - 1 - sprite_x } else { sprite_x };
+                    (src_x, src_y)
+                };
+
+                let tile_row = src_y / 8;
+                let fine_y = src_y % 8;
+                let tile_col = src_x / 8;
+                let fine_x = src_x % 8;
 
                 let tile = if color_256 {
                     let tile_offset = if obj_mapping_1d {
@@ -435,7 +557,7 @@ impl GbaPpu {
                     if offset >= self.vram.len() { continue; }
                     let pal_idx = self.vram[offset];
                     if pal_idx == 0 { continue; }
-                    self.sprite_palette_color(pal_idx as usize * 2)
+                    self.raw_sprite_palette_color(pal_idx as usize * 2)
                 } else {
                     let tile_offset = if obj_mapping_1d {
                         tile_num + tile_row * (w / 8) + tile_col
@@ -447,10 +569,16 @@ impl GbaPpu {
                     let byte = self.vram[offset];
                     let pal_idx = if fine_x & 1 == 0 { byte & 0xF } else { byte >> 4 };
                     if pal_idx == 0 { continue; }
-                    self.sprite_palette_color(palette_num * 32 + pal_idx as usize * 2)
+                    self.raw_sprite_palette_color(palette_num * 32 + pal_idx as usize * 2)
                 };
 
-                self.framebuffer[row_start + screen_x as usize] = tile;
+                self.write_pixel(
+                    row_start + screen_x as usize,
+                    4,
+                    priority,
+                    tile,
+                    obj_mode == 1,
+                );
             }
         }
     }
@@ -474,25 +602,288 @@ impl GbaPpu {
     }
 
     fn palette_color(&self, offset: usize) -> u32 {
+        Self::rgb555_to_argb(self.raw_palette_color(offset))
+    }
+
+    fn raw_palette_color(&self, offset: usize) -> u16 {
         if offset + 1 < self.palette.len() {
-            let color = (self.palette[offset] as u16) | ((self.palette[offset + 1] as u16) << 8);
-            Self::rgb555_to_argb(color)
+            (self.palette[offset] as u16) | ((self.palette[offset + 1] as u16) << 8)
         } else {
-            0xFF_00_00_00
+            0
         }
     }
 
     fn sprite_palette_color(&self, offset: usize) -> u32 {
+        Self::rgb555_to_argb(self.raw_sprite_palette_color(offset))
+    }
+
+    fn raw_sprite_palette_color(&self, offset: usize) -> u16 {
         // Sprite palette starts at 0x200 in palette RAM
         let actual_offset = 0x200 + offset;
-        self.palette_color(actual_offset)
+        self.raw_palette_color(actual_offset)
     }
 
     fn rgb555_to_argb(color: u16) -> u32 {
-        let r = ((color & 0x1F) as u32) * 255 / 31;
-        let g = (((color >> 5) & 0x1F) as u32) * 255 / 31;
-        let b = (((color >> 10) & 0x1F) as u32) * 255 / 31;
-        0xFF_00_00_00 | (r << 16) | (g << 8) | b
+        // Reference-style GBA LCD correction with extra darkening so sprite edge
+        // colors do not lift into pale outlines on a modern panel.
+        const TARGET_GAMMA: f32 = 2.2;
+        const DISPLAY_GAMMA_INV: f32 = 1.0 / 2.2;
+        const DARKEN_SCREEN: f32 = 0.35;
+        const LUMINANCE: f32 = 0.93;
+
+        let r = (color & 0x1F) as f32 / 31.0;
+        let g = ((color >> 5) & 0x1F) as f32 / 31.0;
+        let b = ((color >> 10) & 0x1F) as f32 / 31.0;
+
+        let r = (r.powf(TARGET_GAMMA + DARKEN_SCREEN) * LUMINANCE).clamp(0.0, 1.0);
+        let g = (g.powf(TARGET_GAMMA + DARKEN_SCREEN) * LUMINANCE).clamp(0.0, 1.0);
+        let b = (b.powf(TARGET_GAMMA + DARKEN_SCREEN) * LUMINANCE).clamp(0.0, 1.0);
+
+        let corrected_r = (0.80 * r + 0.275 * g - 0.075 * b).clamp(0.0, 1.0).powf(DISPLAY_GAMMA_INV);
+        let corrected_g = (0.135 * r + 0.64 * g + 0.225 * b).clamp(0.0, 1.0).powf(DISPLAY_GAMMA_INV);
+        let corrected_b = (0.195 * r + 0.155 * g + 0.65 * b).clamp(0.0, 1.0).powf(DISPLAY_GAMMA_INV);
+
+        let r8 = (corrected_r * 255.0 + 0.5) as u32;
+        let g8 = (corrected_g * 255.0 + 0.5) as u32;
+        let b8 = (corrected_b * 255.0 + 0.5) as u32;
+        0xFF_00_00_00 | (r8 << 16) | (g8 << 8) | b8
+    }
+
+    fn write_pixel(&mut self, index: usize, layer: u8, priority: u8, color: u16, semi_transparent: bool) {
+        let lower_color = self.color_buffer[index];
+        let lower_layer = self.layer_buffer[index];
+        let target1 = (self.bldcnt & 0x3F) as u8;
+        let target2 = ((self.bldcnt >> 8) & 0x3F) as u8;
+        let effect = ((self.bldcnt >> 6) & 0x3) as u8;
+        let layer_bit = 1u8 << layer;
+        let effect_enabled = self.effect_enabled_at(index % SCREEN_W);
+
+        let blended = if effect_enabled && (semi_transparent || (target1 & layer_bit != 0)) && effect == 1 {
+            let lower_bit = 1u8 << lower_layer;
+            if target2 & lower_bit != 0 {
+                let eva = (self.bldalpha & 0x1F).min(16) as u32;
+                let evb = ((self.bldalpha >> 8) & 0x1F).min(16) as u32;
+                Self::alpha_blend(color, lower_color, eva, evb)
+            } else {
+                color
+            }
+        } else if effect_enabled && !semi_transparent && target1 & layer_bit != 0 {
+            match effect {
+                2 => Self::brighten(color, self.bldy.min(16) as u32),
+                3 => Self::darken(color, self.bldy.min(16) as u32),
+                _ => color,
+            }
+        } else {
+            color
+        };
+
+        self.color_buffer[index] = blended;
+        self.framebuffer[index] = Self::rgb555_to_argb(blended);
+        self.priority_buffer[index] = priority;
+        self.layer_buffer[index] = layer;
+    }
+
+    fn alpha_blend(top: u16, bottom: u16, eva: u32, evb: u32) -> u16 {
+        let blend = |shift: u32| {
+            let a = (top >> shift) & 0x1F;
+            let b = (bottom >> shift) & 0x1F;
+            ((a as u32 * eva + b as u32 * evb) / 16).min(31) as u16
+        };
+        blend(0) | (blend(5) << 5) | (blend(10) << 10)
+    }
+
+    fn brighten(color: u16, evy: u32) -> u16 {
+        let adjust = |shift: u32| {
+            let c = ((color >> shift) & 0x1F) as u32;
+            (c + ((31 - c) * evy) / 16).min(31) as u16
+        };
+        adjust(0) | (adjust(5) << 5) | (adjust(10) << 10)
+    }
+
+    fn darken(color: u16, evy: u32) -> u16 {
+        let adjust = |shift: u32| {
+            let c = ((color >> shift) & 0x1F) as u32;
+            (c - (c * evy) / 16) as u16
+        };
+        adjust(0) | (adjust(5) << 5) | (adjust(10) << 10)
+    }
+
+    fn obj_affine_params(&self, idx: usize) -> (i16, i16, i16, i16) {
+        let base = idx * 0x20;
+        let pa = self.read_oam_i16(base + 0x06);
+        let pb = self.read_oam_i16(base + 0x0E);
+        let pc = self.read_oam_i16(base + 0x16);
+        let pd = self.read_oam_i16(base + 0x1E);
+        (pa, pb, pc, pd)
+    }
+
+    fn read_oam_i16(&self, offset: usize) -> i16 {
+        let lo = self.oam[offset] as u16;
+        let hi = self.oam[offset + 1] as u16;
+        (lo | (hi << 8)) as i16
+    }
+
+    fn layer_enabled_at(&self, bg: usize, x: usize) -> bool {
+        self.window_flags_scanline[x] & (1 << bg) != 0
+    }
+
+    fn obj_enabled_at(&self, x: usize) -> bool {
+        self.window_flags_scanline[x] & (1 << 4) != 0
+    }
+
+    fn effect_enabled_at(&self, x: usize) -> bool {
+        self.window_flags_scanline[x] & 0x20 != 0
+    }
+
+    fn build_window_scanline(&mut self, y: usize) {
+        let win0_en = self.dispcnt & 0x2000 != 0;
+        let win1_en = self.dispcnt & 0x4000 != 0;
+        let objwin_en = self.dispcnt & 0x8000 != 0;
+
+        for x in 0..SCREEN_W {
+            self.window_flags_scanline[x] = if win0_en && self.in_window(0, x, y) {
+                (self.winin & 0x3F) as u8
+            } else if win1_en && self.in_window(1, x, y) {
+                ((self.winin >> 8) & 0x3F) as u8
+            } else if objwin_en && self.obj_window_scanline[x] {
+                ((self.winout >> 8) & 0x3F) as u8
+            } else if win0_en || win1_en || objwin_en {
+                (self.winout & 0x3F) as u8
+            } else {
+                0x3F
+            };
+        }
+    }
+
+    fn build_obj_window_scanline(&mut self, line: usize) {
+        self.obj_window_scanline.fill(false);
+        if self.dispcnt & 0x8000 == 0 {
+            return;
+        }
+
+        for i in (0..128).rev() {
+            let base = i * 8;
+            let attr0 = (self.oam[base] as u16) | ((self.oam[base + 1] as u16) << 8);
+            let attr1 = (self.oam[base + 2] as u16) | ((self.oam[base + 3] as u16) << 8);
+            let attr2 = (self.oam[base + 4] as u16) | ((self.oam[base + 5] as u16) << 8);
+
+            let affine = attr0 & 0x0100 != 0;
+            let double_size_or_disable = attr0 & 0x0200 != 0;
+            let obj_mode = (attr0 >> 10) & 3;
+            if obj_mode != 2 {
+                continue;
+            }
+            if !affine && double_size_or_disable {
+                continue;
+            }
+
+            let shape = (attr0 >> 14) & 3;
+            let size = (attr1 >> 14) & 3;
+            let (w, h) = Self::obj_size(shape, size);
+            let disp_w = if affine && double_size_or_disable { w * 2 } else { w };
+            let disp_h = if affine && double_size_or_disable { h * 2 } else { h };
+
+            let y = (attr0 & 0xFF) as i32;
+            let y = if y >= 160 { y - 256 } else { y };
+            if (line as i32) < y || (line as i32) >= y + disp_h as i32 {
+                continue;
+            }
+
+            let x = (attr1 & 0x1FF) as i32;
+            let x = if x >= 240 { x - 512 } else { x };
+            let tile_num = (attr2 & 0x3FF) as usize;
+            let color_256 = attr0 & 0x2000 != 0;
+            let h_flip = !affine && attr1 & 0x1000 != 0;
+            let v_flip = !affine && attr1 & 0x2000 != 0;
+            let obj_mapping_1d = self.dispcnt & 0x40 != 0;
+            let affine_idx = ((attr1 >> 9) & 0x1F) as usize;
+            let (pa, pb, pc, pd) = if affine {
+                self.obj_affine_params(affine_idx)
+            } else {
+                (0x100, 0, 0, 0x100)
+            };
+
+            for sprite_x in 0..disp_w {
+                let screen_x = x + sprite_x as i32;
+                if screen_x < 0 || screen_x >= SCREEN_W as i32 {
+                    continue;
+                }
+
+                let local_y = (line as i32 - y) as isize;
+                let local_x = sprite_x as isize;
+                let (src_x, src_y) = if affine {
+                    let center_x = disp_w as isize / 2;
+                    let center_y = disp_h as isize / 2;
+                    let dx = local_x - center_x;
+                    let dy = local_y - center_y;
+                    let src_x = ((pa as isize * dx + pb as isize * dy) >> 8) + (w as isize / 2);
+                    let src_y = ((pc as isize * dx + pd as isize * dy) >> 8) + (h as isize / 2);
+                    if src_x < 0 || src_y < 0 || src_x >= w as isize || src_y >= h as isize {
+                        continue;
+                    }
+                    (src_x as usize, src_y as usize)
+                } else {
+                    let src_y = if v_flip { h - 1 - local_y as usize } else { local_y as usize };
+                    let src_x = if h_flip { w - 1 - sprite_x } else { sprite_x };
+                    (src_x, src_y)
+                };
+
+                let tile_row = src_y / 8;
+                let fine_y = src_y % 8;
+                let tile_col = src_x / 8;
+                let fine_x = src_x % 8;
+
+                let opaque = if color_256 {
+                    let tile_offset = if obj_mapping_1d {
+                        tile_num + tile_row * (w / 8) * 2 + tile_col * 2
+                    } else {
+                        tile_num + tile_row * 32 + tile_col * 2
+                    };
+                    let offset = 0x10000 + tile_offset * 32 + fine_y * 8 + fine_x;
+                    offset < self.vram.len() && self.vram[offset] != 0
+                } else {
+                    let tile_offset = if obj_mapping_1d {
+                        tile_num + tile_row * (w / 8) + tile_col
+                    } else {
+                        tile_num + tile_row * 32 + tile_col
+                    };
+                    let offset = 0x10000 + tile_offset * 32 + fine_y * 4 + fine_x / 2;
+                    if offset >= self.vram.len() {
+                        false
+                    } else {
+                        let byte = self.vram[offset];
+                        let pal_idx = if fine_x & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                        pal_idx != 0
+                    }
+                };
+
+                if opaque {
+                    self.obj_window_scanline[screen_x as usize] = true;
+                }
+            }
+        }
+    }
+
+    fn in_window(&self, idx: usize, x: usize, y: usize) -> bool {
+        let winh = self.winh[idx];
+        let winv = self.winv[idx];
+        let left = ((winh >> 8) & 0xFF) as usize;
+        let right = (winh & 0xFF) as usize;
+        let top = ((winv >> 8) & 0xFF) as usize;
+        let bottom = (winv & 0xFF) as usize;
+
+        let x_in = if left <= right {
+            x >= left && x < right
+        } else {
+            x >= left || x < right
+        };
+        let y_in = if top <= bottom {
+            y >= top && y < bottom
+        } else {
+            y >= top || y < bottom
+        };
+
+        x_in && y_in
     }
 
     pub fn read_io(&self, addr: u32) -> u8 {
@@ -624,8 +1015,9 @@ impl GbaPpu {
 
     pub fn read_dispstat(&self) -> u16 {
         let vblank = if self.vcount >= 160 && self.vcount < 228 { 1 } else { 0 };
+        let hblank = if self.vcount < 160 && self.cycles >= 960 { 2 } else { 0 };
         let vcounter = if self.vcount == (self.dispstat >> 8) { 4 } else { 0 };
-        (self.dispstat & 0xFFF8) | vcounter | vblank
+        (self.dispstat & 0xFFF8) | vcounter | hblank | vblank
     }
 
     pub fn write_dispstat(&mut self, byte: u32, val: u8) {
@@ -635,5 +1027,60 @@ impl GbaPpu {
         } else {
             self.dispstat = (self.dispstat & 0x00FF) | ((val as u16) << 8);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GbaPpu;
+
+    #[test]
+    fn gba_color_correction_keeps_black_black() {
+        assert_eq!(GbaPpu::rgb555_to_argb(0x0000), 0xFF_00_00_00);
+    }
+
+    #[test]
+    fn gba_color_correction_tames_full_white() {
+        let corrected = GbaPpu::rgb555_to_argb(0x7FFF) & 0x00FF_FFFF;
+        assert!(corrected < 0x00FF_FFFF);
+    }
+
+    #[test]
+    fn gba_color_correction_preserves_red_dominance() {
+        let corrected = GbaPpu::rgb555_to_argb(0x001F);
+        let r = (corrected >> 16) & 0xFF;
+        let g = (corrected >> 8) & 0xFF;
+        let b = corrected & 0xFF;
+        assert!(r > g);
+        assert!(r > b);
+    }
+
+    #[test]
+    fn gba_color_correction_keeps_dark_outline_shades_dark() {
+        let corrected = GbaPpu::rgb555_to_argb(0x20E5);
+        let r = (corrected >> 16) & 0xFF;
+        let g = (corrected >> 8) & 0xFF;
+        let b = corrected & 0xFF;
+        assert!(r < 50);
+        assert!(g < 50);
+        assert!(b < 55);
+    }
+
+    #[test]
+    fn mode4_palette_index_zero_is_opaque() {
+        let mut ppu = GbaPpu::new();
+
+        ppu.bgcnt[2] = 0;
+        ppu.vram[0] = 0;
+        ppu.palette[0] = 0x00;
+        ppu.palette[1] = 0x00;
+
+        ppu.color_buffer[0] = 0x7FFF;
+        ppu.framebuffer[0] = GbaPpu::rgb555_to_argb(0x7FFF);
+
+        ppu.render_mode4(0);
+
+        assert_eq!(ppu.color_buffer[0], 0x0000);
+        assert_eq!(ppu.framebuffer[0], GbaPpu::rgb555_to_argb(0x0000));
     }
 }
