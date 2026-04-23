@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -462,7 +462,7 @@ impl EmuApp {
             .unwrap_or_else(|| "No ROM loaded".to_string())
     }
 
-    fn rom_name_from_path(&self, path: &PathBuf) -> String {
+    fn rom_name_from_path(&self, path: &Path) -> String {
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string())
@@ -523,7 +523,7 @@ impl EmuApp {
     }
 
     fn save_backup(&self) {
-        if let Some(ref path) = self.rom_path {
+        if let Some(path) = self.rom_path.as_deref() {
             match &self.emu {
                 Emulator::Gbc(emu) => save::save_gbc_sram(path, emu),
                 Emulator::Gba(emu) => save::save_gba_backup(path, emu),
@@ -709,12 +709,8 @@ impl EmuApp {
     }
 
     fn save_state(&mut self) {
-        if let Some(ref path) = self.rom_path {
-            let result = match &self.emu {
-                Emulator::Gbc(emu) => save::save_gbc_state(path, self.save_slot, emu),
-                Emulator::Gba(emu) => save::save_gba_state(path, self.save_slot, emu),
-                Emulator::None => return,
-            };
+        if let Some(path) = self.rom_path.as_deref() {
+            let result = self.save_state_to_slot(path);
 
             self.status_msg = match result {
                 Ok(()) => format!("State saved to slot {}", self.save_slot),
@@ -724,26 +720,42 @@ impl EmuApp {
     }
 
     fn load_state(&mut self) {
-        if let Some(ref path) = self.rom_path {
-            match &self.emu {
-                Emulator::Gbc(_) => match save::load_gbc_state(path, self.save_slot) {
-                    Ok(emu) => {
-                        self.emu = Emulator::Gbc(emu);
-                        self.reset_timing();
-                        self.status_msg = format!("State loaded from slot {}", self.save_slot);
-                    }
-                    Err(error) => self.status_msg = format!("Load failed: {}", error),
-                },
-                Emulator::Gba(_) => match save::load_gba_state(path, self.save_slot) {
-                    Ok(emu) => {
-                        self.emu = Emulator::Gba(emu);
-                        self.reset_timing();
-                        self.status_msg = format!("State loaded from slot {}", self.save_slot);
-                    }
-                    Err(error) => self.status_msg = format!("Load failed: {}", error),
-                },
-                Emulator::None => {}
+        if let Some(path) = self.rom_path.as_deref() {
+            match self.load_state_from_slot(path) {
+                Ok(Some(emu)) => {
+                    self.emu = emu;
+                    self.reset_timing();
+                    self.status_msg = format!("State loaded from slot {}", self.save_slot);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.status_msg = format!("Load failed: {}", error);
+                }
             }
+        }
+    }
+
+    fn save_state_to_slot(&self, path: &Path) -> Result<(), String> {
+        match &self.emu {
+            Emulator::Gbc(emu) => save::save_gbc_state(path, self.save_slot, emu)
+                .map_err(|error| error.to_string()),
+            Emulator::Gba(emu) => save::save_gba_state(path, self.save_slot, emu)
+                .map_err(|error| error.to_string()),
+            Emulator::None => Ok(()),
+        }
+    }
+
+    fn load_state_from_slot(&self, path: &Path) -> Result<Option<Emulator>, String> {
+        match &self.emu {
+            Emulator::Gbc(_) => save::load_gbc_state(path, self.save_slot)
+                .map(Emulator::Gbc)
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            Emulator::Gba(_) => save::load_gba_state(path, self.save_slot)
+                .map(Emulator::Gba)
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            Emulator::None => Ok(None),
         }
     }
 
