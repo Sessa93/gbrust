@@ -52,7 +52,6 @@ const CPSR_Z: u32 = 1 << 30;
 const CPSR_C: u32 = 1 << 29;
 const CPSR_V: u32 = 1 << 28;
 const CPSR_I: u32 = 1 << 7;
-const CPSR_F: u32 = 1 << 6;
 const CPSR_T: u32 = 1 << 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

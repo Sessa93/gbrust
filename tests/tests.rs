@@ -294,6 +294,49 @@ mod tests {
             bus.write32(addr, instr);
         }
 
+        fn rtc_set_data(bus: &mut GbaBus, value: u8) {
+            bus.write16(0x0800_00C4, value as u16);
+        }
+
+        fn rtc_set_direction(bus: &mut GbaBus, direction: u8) {
+            bus.write16(0x0800_00C6, direction as u16);
+        }
+
+        fn rtc_start_transfer(bus: &mut GbaBus) {
+            rtc_set_direction(bus, 0x07);
+            rtc_set_data(bus, 0x00);
+            rtc_set_data(bus, 0x04);
+        }
+
+        fn rtc_finish_transfer(bus: &mut GbaBus) {
+            rtc_set_direction(bus, 0x07);
+            rtc_set_data(bus, 0x00);
+        }
+
+        fn rtc_write_byte(bus: &mut GbaBus, value: u8) {
+            rtc_set_direction(bus, 0x07);
+            for bit in 0..8 {
+                let bit_value = (value >> bit) & 1;
+                rtc_set_data(bus, 0x04 | (bit_value << 1));
+                rtc_set_data(bus, 0x05 | (bit_value << 1));
+            }
+        }
+
+        fn rtc_read_byte(bus: &mut GbaBus) -> u8 {
+            let mut value = 0;
+            rtc_set_direction(bus, 0x05);
+            for bit in 0..8 {
+                rtc_set_data(bus, 0x04);
+                value |= (((bus.read16(0x0800_00C4) >> 1) & 1) as u8) << bit;
+                rtc_set_data(bus, 0x05);
+            }
+            value
+        }
+
+        fn rtc_from_bcd(value: u8) -> u8 {
+            ((value >> 4) & 0x0F) * 10 + (value & 0x0F)
+        }
+
         #[test]
         fn initial_state() {
             let cpu = Arm7Tdmi::new();
@@ -398,6 +441,86 @@ mod tests {
             write_arm(&mut bus, 0x0800_0000, 0xE180_2001);
             cpu.step(&mut bus);
             assert_eq!(cpu.regs[2], 0xFFFF);
+        }
+
+        #[test]
+        fn gba_irq_dispatch_from_thumb_handler_updates_ram() {
+            let mut cpu = Arm7Tdmi::new();
+            let cart = GbaCartridge::load(vec![0; 0x200]);
+            let mut bus = GbaBus::new(cart);
+            let resume_pc = 0x0800_1234;
+            let handler = 0x0300_0000;
+            let flag_addr = 0x0200_0000;
+
+            cpu.regs[15] = resume_pc;
+            cpu.cpsr |= 1 << 5;
+            bus.ime = true;
+            bus.ie = 0x0001;
+            bus.iflag = 0x0001;
+
+            bus.write32(0x0300_7FFC, handler);
+            write_arm(&mut bus, handler, 0xE59F_0008); // LDR R0, [PC, #8]
+            write_arm(&mut bus, handler + 4, 0xE3A0_1001); // MOV R1, #1
+            write_arm(&mut bus, handler + 8, 0xE580_1000); // STR R1, [R0]
+            write_arm(&mut bus, handler + 12, 0xE12F_FF1E); // BX LR
+            write_arm(&mut bus, handler + 16, flag_addr);
+
+            cpu.handle_irq();
+            for _ in 0..13 {
+                cpu.step(&mut bus);
+            }
+
+            assert_eq!(bus.read32(flag_addr), 1);
+            assert_eq!(cpu.regs[15], resume_pc);
+            assert!(cpu.thumb_mode());
+        }
+
+        #[test]
+        fn gba_rtc_gpio_control_register_is_readable() {
+            let mut rom = vec![0; 0x200];
+            rom[0x100..0x105].copy_from_slice(b"RTC_V");
+
+            let cart = GbaCartridge::load(rom);
+            let mut bus = GbaBus::new(cart);
+
+            bus.write16(0x0800_00C8, 1);
+
+            rtc_start_transfer(&mut bus);
+            rtc_write_byte(&mut bus, 0xC6);
+            let control = rtc_read_byte(&mut bus);
+            rtc_finish_transfer(&mut bus);
+
+            assert_eq!(control, 0x40);
+        }
+
+        #[test]
+        fn gba_rtc_datetime_read_returns_valid_bcd_fields() {
+            let mut rom = vec![0; 0x200];
+            rom[0x100..0x105].copy_from_slice(b"RTC_V");
+
+            let cart = GbaCartridge::load(rom);
+            let mut bus = GbaBus::new(cart);
+
+            bus.write16(0x0800_00C8, 1);
+
+            rtc_start_transfer(&mut bus);
+            rtc_write_byte(&mut bus, 0xA6);
+            let year = rtc_from_bcd(rtc_read_byte(&mut bus));
+            let month = rtc_from_bcd(rtc_read_byte(&mut bus));
+            let day = rtc_from_bcd(rtc_read_byte(&mut bus));
+            let weekday = rtc_from_bcd(rtc_read_byte(&mut bus));
+            let hour = rtc_from_bcd(rtc_read_byte(&mut bus));
+            let minute = rtc_from_bcd(rtc_read_byte(&mut bus));
+            let second = rtc_from_bcd(rtc_read_byte(&mut bus));
+            rtc_finish_transfer(&mut bus);
+
+            assert!(year <= 99);
+            assert!((1..=12).contains(&month));
+            assert!((1..=31).contains(&day));
+            assert!(weekday <= 6);
+            assert!(hour <= 23);
+            assert!(minute <= 59);
+            assert!(second <= 59);
         }
 
         #[test]
@@ -965,16 +1088,76 @@ mod tests {
     // ─── Cartridge Tests ───────────────────────────────────
 
     mod cartridge {
+        use std::fs;
+        use std::path::PathBuf;
+
         use gbrust::cartridge::{CartridgeType, GbcCartridge, GbaCartridge, GbaBackupType};
         use gbrust::cartridge::mbc::{Mbc, MbcType};
         use gbrust::cpu::arm7tdmi::Arm7Bus;
+        use gbrust::emulator::gba::GbaEmulator;
         use gbrust::memory::gba_bus::GbaBus;
+        use gbrust::save;
 
         fn make_gba_eeprom_cart() -> GbaCartridge {
             let mut rom = vec![0u8; 0x100000];
             let sig = b"EEPROM_V";
             rom[0x1000..0x1008].copy_from_slice(sig);
             GbaCartridge::load(rom)
+        }
+
+        fn make_gba_mario_eeprom_cart() -> GbaCartridge {
+            let mut rom = vec![0u8; 0x100000];
+            let sig = b"EEPROM_V";
+            rom[0x1000..0x1008].copy_from_slice(sig);
+            rom[0xAC..0xB0].copy_from_slice(b"AA2E");
+            GbaCartridge::load(rom)
+        }
+
+        fn make_gba_flash128k_cart() -> GbaCartridge {
+            let mut rom = vec![0u8; 0x100000];
+            let sig = b"FLASH1M_V";
+            rom[0x1000..0x1009].copy_from_slice(sig);
+            GbaCartridge::load(rom)
+        }
+
+        fn temp_rom_path(name: &str) -> PathBuf {
+            let unique = format!(
+                "gbrust-{}-{}-{}",
+                name,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            std::env::temp_dir().join(unique).with_extension("gba")
+        }
+
+        fn flash_unlock_command(cart: &mut GbaCartridge, command: u8) {
+            cart.write_sram(0x0E00_5555, 0xAA);
+            cart.write_sram(0x0E00_2AAA, 0x55);
+            cart.write_sram(0x0E00_5555, command);
+        }
+
+        fn write_pokemon_flash_footer(data: &mut [u8], sector: usize, section_id: u16, save_index: u32) {
+            let footer = &mut data[sector * 0x1000 + 0xFF4..sector * 0x1000 + 0x1000];
+            footer[0..2].copy_from_slice(&section_id.to_le_bytes());
+            footer[2..4].copy_from_slice(&0u16.to_le_bytes());
+            footer[4..8].copy_from_slice(&0x0801_2025u32.to_le_bytes());
+            footer[8..12].copy_from_slice(&save_index.to_le_bytes());
+        }
+
+        fn write_dma_bits(bus: &mut GbaBus, src: u32, bits: &[u8]) {
+            for (index, bit) in bits.iter().copied().enumerate() {
+                bus.write16(src + (index as u32) * 2, bit as u16);
+            }
+        }
+
+        fn run_dma3(bus: &mut GbaBus, src: u32, dst: u32, count: u16) {
+            bus.write32(0x0400_00D4, src);
+            bus.write32(0x0400_00D8, dst);
+            bus.write32(0x0400_00DC, 0x8000_0000 | count as u32);
+            bus.tick(0);
         }
 
         #[test]
@@ -1060,12 +1243,93 @@ mod tests {
         }
 
         #[test]
+        fn gba_flash128k_accesses_upper_half_of_bank_window() {
+            let mut cart = make_gba_flash128k_cart();
+
+            flash_unlock_command(&mut cart, 0xA0);
+            cart.write_sram(0x0E00_D123, 0x5A);
+
+            assert_eq!(cart.read_sram(0x0E00_D123), 0x5A);
+            assert_eq!(cart.flash[0xD123], 0x5A);
+        }
+
+        #[test]
         fn gba_eeprom_dma_detects_addr_length() {
             let mut cart = make_gba_eeprom_cart();
             cart.notify_eeprom_dma(17);
             assert_eq!(cart.eeprom_addr_len, 14);
             cart.notify_eeprom_dma(9);
             assert_eq!(cart.eeprom_addr_len, 6);
+        }
+
+        #[test]
+        fn gba_eeprom_size_matches_detected_bus_width() {
+            let mut cart = make_gba_eeprom_cart();
+            assert_eq!(cart.eeprom_size(), 0x200);
+
+            cart.notify_eeprom_dma(17);
+            assert_eq!(cart.eeprom_size(), 0x2000);
+
+            cart.notify_eeprom_dma(9);
+            assert_eq!(cart.eeprom_size(), 0x200);
+        }
+
+        #[test]
+        fn gba_mario_eeprom_forces_8k_geometry() {
+            let mut cart = make_gba_mario_eeprom_cart();
+
+            assert_eq!(cart.eeprom_size(), 0x2000);
+
+            cart.notify_eeprom_dma(17);
+            assert_eq!(cart.eeprom_addr_len, 14);
+            assert_eq!(cart.eeprom_size(), 0x2000);
+
+            cart.notify_eeprom_dma(81);
+            assert_eq!(cart.eeprom_addr_len, 14);
+            assert_eq!(cart.eeprom_size(), 0x2000);
+        }
+
+        #[test]
+        fn gba_mario_eeprom_dma_roundtrip_matches_written_bits() {
+            let cart = make_gba_mario_eeprom_cart();
+            let mut bus = GbaBus::new(cart);
+            let write_src = 0x0200_4000;
+            let read_cmd_src = 0x0200_4200;
+            let read_dst = 0x0200_4400;
+            let address = 0x0123u16;
+            let data = 0x0123_4567_89AB_CDEFu64;
+
+            let mut write_bits = Vec::with_capacity(81);
+            write_bits.extend_from_slice(&[1, 0]);
+            for shift in (0..14).rev() {
+                write_bits.push(((address >> shift) & 1) as u8);
+            }
+            for shift in (0..64).rev() {
+                write_bits.push(((data >> shift) & 1) as u8);
+            }
+            write_bits.push(0);
+            write_dma_bits(&mut bus, write_src, &write_bits);
+            run_dma3(&mut bus, write_src, 0x0D00_0000, write_bits.len() as u16);
+
+            assert_eq!(bus.read16(0x0D00_0000) & 1, 1);
+
+            let mut read_cmd_bits = Vec::with_capacity(17);
+            read_cmd_bits.extend_from_slice(&[1, 1]);
+            for shift in (0..14).rev() {
+                read_cmd_bits.push(((address >> shift) & 1) as u8);
+            }
+            read_cmd_bits.push(0);
+            write_dma_bits(&mut bus, read_cmd_src, &read_cmd_bits);
+            run_dma3(&mut bus, read_cmd_src, 0x0D00_0000, read_cmd_bits.len() as u16);
+            run_dma3(&mut bus, 0x0D00_0000, read_dst, 68);
+
+            for index in 0..4u32 {
+                assert_eq!(bus.read16(read_dst + index * 2) & 1, 0);
+            }
+
+            for (index, expected) in (0..64).rev().map(|shift| ((data >> shift) & 1) as u16).enumerate() {
+                assert_eq!(bus.read16(read_dst + ((index as u32 + 4) * 2)) & 1, expected);
+            }
         }
 
         #[test]
@@ -1141,6 +1405,87 @@ mod tests {
             }
             assert_eq!(bus.read16(0x0D00_0000) & 1, 1);
         }
+
+        #[test]
+        fn gba_save_persists_8k_eeprom_for_mario_like_roms() {
+            let rom_path = temp_rom_path("mario-eeprom-8k");
+            let save_path = rom_path.with_extension("sav");
+            let mut emu = GbaEmulator::new(make_gba_mario_eeprom_cart());
+
+            emu.bus.cart.notify_eeprom_dma(17);
+            emu.bus.cart.eeprom[0x1FF] = 0x5A;
+            emu.bus.cart.eeprom[0x1FFE] = 0xC3;
+
+            save::save_gba_backup(&rom_path, &emu);
+
+            let metadata = fs::metadata(&save_path).unwrap();
+            assert_eq!(metadata.len(), 0x2000);
+
+            let saved = fs::read(&save_path).unwrap();
+            assert_eq!(saved[0x1FF], 0x5A);
+            assert_eq!(saved[0x1FFE], 0xC3);
+            assert_eq!(saved.len(), 0x2000);
+
+            let _ = fs::remove_file(&save_path);
+        }
+
+        #[test]
+        fn gba_flash_legacy_incomplete_pokemon_save_is_ignored_on_load() {
+            let rom_path = temp_rom_path("pokemon-incomplete-flash");
+            let save_path = rom_path.with_extension("sav");
+            let mut data = vec![0xFF; 0x20000];
+
+            for (sector, section_id) in [(6usize, 13u16), (7, 0), (16, 9), (17, 10), (18, 11), (19, 12), (20, 5), (21, 6), (22, 7), (23, 8)] {
+                write_pokemon_flash_footer(&mut data, sector, section_id, 1);
+            }
+
+            fs::write(&save_path, &data).unwrap();
+
+            let mut emu = GbaEmulator::new(make_gba_flash128k_cart());
+            save::load_gba_backup(&rom_path, &mut emu);
+
+            assert!(emu.bus.cart.flash.iter().all(|&byte| byte == 0xFF));
+
+            let _ = fs::remove_file(&save_path);
+        }
+
+        #[test]
+        fn gba_loads_full_8k_eeprom_backup_when_file_size_requires_it() {
+            let rom_path = temp_rom_path("generic-eeprom-8k");
+            let save_path = rom_path.with_extension("sav");
+            let mut data = vec![0xFF; 0x2000];
+            data[0x1FFE] = 0x12;
+            data[0x1FFF] = 0x34;
+            fs::write(&save_path, &data).unwrap();
+
+            let mut emu = GbaEmulator::new(make_gba_eeprom_cart());
+            save::load_gba_backup(&rom_path, &mut emu);
+
+            assert_eq!(emu.bus.cart.eeprom_addr_len, 14);
+            assert_eq!(emu.bus.cart.eeprom[0x1FFE], 0x12);
+            assert_eq!(emu.bus.cart.eeprom[0x1FFF], 0x34);
+
+            let _ = fs::remove_file(&save_path);
+        }
+
+        #[test]
+        fn gba_mario_loads_full_8k_eeprom_backup() {
+            let rom_path = temp_rom_path("mario-eeprom-8k-load");
+            let save_path = rom_path.with_extension("sav");
+            let mut data = vec![0xFF; 0x2000];
+            data[0x1FFE] = 0x12;
+            data[0x1FFF] = 0x34;
+            fs::write(&save_path, &data).unwrap();
+
+            let mut emu = GbaEmulator::new(make_gba_mario_eeprom_cart());
+            save::load_gba_backup(&rom_path, &mut emu);
+
+            assert_eq!(emu.bus.cart.eeprom_addr_len, 14);
+            assert_eq!(emu.bus.cart.eeprom[0x1FFE], 0x12);
+            assert_eq!(emu.bus.cart.eeprom[0x1FFF], 0x34);
+
+            let _ = fs::remove_file(&save_path);
+        }
     }
 
     // ─── PPU Tests ─────────────────────────────────────────
@@ -1193,14 +1538,15 @@ mod tests {
             assert_eq!(ppu.vram.len(), 96 * 1024);
             assert_eq!(ppu.palette.len(), 1024);
             assert_eq!(ppu.oam.len(), 1024);
+            assert_eq!(ppu.vcount, 161);
+            assert_ne!(ppu.read_dispstat() & 0x1, 0);
         }
 
         #[test]
         fn gba_ppu_dispstat() {
             let ppu = GbaPpu::new();
             let dispstat = ppu.read_dispstat();
-            // vcount=0 matches lyc=0 at init, so vcounter bit (bit 2) is set
-            assert_eq!(dispstat & 7, 4);
+            assert_eq!(dispstat & 7, 1);
         }
     }
 

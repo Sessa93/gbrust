@@ -431,6 +431,9 @@ impl Arm7Bus for GbaBus {
                 }
             }
             0x07 => {} // OAM ignores 8-bit writes
+            0x08..=0x0C => {
+                self.cart.write_rom(addr, val);
+            }
             0x0D => {
                 use crate::cartridge::GbaBackupType;
                 if self.cart.backup_type == GbaBackupType::Eeprom {

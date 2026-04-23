@@ -52,8 +52,8 @@ impl GbaEmulator {
 
         self.total_frames += 1;
 
-        if self.repair_legacy_palette_state && crate::save::gba_palette_has_duplicated_banks(self) {
-            crate::save::repair_gba_palette_state_if_needed(self);
+        if crate::save::gba_palette_has_duplicated_banks(self) {
+            self.repair_legacy_palette_state |= crate::save::repair_gba_palette_state_if_needed(self);
         }
 
         &self.bus.ppu.framebuffer

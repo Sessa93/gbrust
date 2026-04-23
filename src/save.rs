@@ -6,6 +6,9 @@ use crate::emulator::gbc::GbcEmulator;
 
 const GBA_PALETTE_RAM_SIZE: usize = 0x400;
 const GBA_PALETTE_BANK_SIZE: usize = 0x20;
+const GBA_FLASH_SECTOR_SIZE: usize = 0x1000;
+const POKEMON_GBA_SAVE_SIGNATURE: u32 = 0x0801_2025;
+const POKEMON_GBA_SECTION_COUNT: usize = 14;
 
 fn bank_has_duplicated_low_halfwords(src: &[u8], dst: &[u8]) -> bool {
     if src.len() != GBA_PALETTE_BANK_SIZE || dst.len() != GBA_PALETTE_BANK_SIZE {
@@ -34,18 +37,34 @@ fn bank_has_duplicated_low_halfwords(src: &[u8], dst: &[u8]) -> bool {
     informative_word_found
 }
 
-fn bank_is_duplicated_low_halfwords(dst: &[u8]) -> bool {
+fn bank_is_informatively_duplicated_low_halfwords(dst: &[u8]) -> bool {
     if dst.len() != GBA_PALETTE_BANK_SIZE {
         return false;
     }
+
+    let mut has_non_zero_halfword = false;
+    let mut distinct_halfwords = false;
+    let mut previous_halfword = None;
 
     for offset in (0..GBA_PALETTE_BANK_SIZE).step_by(4) {
         if dst[offset] != dst[offset + 2] || dst[offset + 1] != dst[offset + 3] {
             return false;
         }
+
+        let halfword = [dst[offset], dst[offset + 1]];
+        if halfword != [0, 0] {
+            has_non_zero_halfword = true;
+        }
+        if let Some(previous) = previous_halfword {
+            if previous != halfword {
+                distinct_halfwords = true;
+            }
+        } else {
+            previous_halfword = Some(halfword);
+        }
     }
 
-    true
+    has_non_zero_halfword && distinct_halfwords
 }
 
 pub(crate) fn gba_palette_has_duplicated_banks(emu: &GbaEmulator) -> bool {
@@ -53,7 +72,7 @@ pub(crate) fn gba_palette_has_duplicated_banks(emu: &GbaEmulator) -> bool {
         .ppu
         .palette
         .chunks_exact(GBA_PALETTE_BANK_SIZE)
-        .any(bank_is_duplicated_low_halfwords)
+    .any(bank_is_informatively_duplicated_low_halfwords)
 }
 
 pub(crate) fn repair_gba_palette_state_if_needed(emu: &mut GbaEmulator) -> bool {
@@ -116,6 +135,40 @@ fn save_path(rom_path: &Path, ext: &str) -> PathBuf {
     rom_path.with_extension(ext)
 }
 
+fn gba_backup_is_incomplete_pokemon_flash_save(data: &[u8]) -> bool {
+    if data.len() < GBA_FLASH_SECTOR_SIZE {
+        return false;
+    }
+
+    let mut has_pokemon_footer = false;
+    let mut section_masks = Vec::<(u32, u16)>::new();
+    let complete_mask = (1u16 << POKEMON_GBA_SECTION_COUNT) - 1;
+
+    for sector in data.chunks_exact(GBA_FLASH_SECTOR_SIZE) {
+        let footer = &sector[GBA_FLASH_SECTOR_SIZE - 12..];
+        let signature = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
+        if signature != POKEMON_GBA_SAVE_SIGNATURE {
+            continue;
+        }
+
+        has_pokemon_footer = true;
+
+        let section_id = u16::from_le_bytes([footer[0], footer[1]]) as usize;
+        if section_id >= POKEMON_GBA_SECTION_COUNT {
+            continue;
+        }
+
+        let save_index = u32::from_le_bytes([footer[8], footer[9], footer[10], footer[11]]);
+        if let Some((_, mask)) = section_masks.iter_mut().find(|(index, _)| *index == save_index) {
+            *mask |= 1u16 << section_id;
+        } else {
+            section_masks.push((save_index, 1u16 << section_id));
+        }
+    }
+
+    has_pokemon_footer && !section_masks.iter().any(|(_, mask)| *mask == complete_mask)
+}
+
 // ─── GBC Save/Load ────────────────────────────────────
 
 pub fn save_gbc_sram(rom_path: &Path, emu: &GbcEmulator) {
@@ -167,10 +220,10 @@ pub fn load_gbc_state(rom_path: &Path, slot: u8) -> Result<GbcEmulator, String> 
 pub fn save_gba_backup(rom_path: &Path, emu: &GbaEmulator) {
     use crate::cartridge::GbaBackupType;
     let path = save_path(rom_path, "sav");
-    let data = match emu.bus.cart.backup_type {
+    let data: &[u8] = match emu.bus.cart.backup_type {
         GbaBackupType::Sram => &emu.bus.cart.sram,
         GbaBackupType::Flash64k | GbaBackupType::Flash128k => &emu.bus.cart.flash,
-        GbaBackupType::Eeprom => &emu.bus.cart.eeprom,
+        GbaBackupType::Eeprom => &emu.bus.cart.eeprom[..emu.bus.cart.eeprom_size()],
         GbaBackupType::None => return,
     };
     if let Err(e) = fs::write(&path, data) {
@@ -188,10 +241,30 @@ pub fn load_gba_backup(rom_path: &Path, emu: &mut GbaEmulator) {
     }
     match fs::read(&path) {
         Ok(data) => {
-            let target = match emu.bus.cart.backup_type {
+            if emu.bus.cart.backup_type == GbaBackupType::Flash128k
+                && gba_backup_is_incomplete_pokemon_flash_save(&data)
+            {
+                log::warn!(
+                    "Ignoring legacy incomplete Pokemon-style flash save at {}",
+                    path.display()
+                );
+                return;
+            }
+
+            let target: &mut [u8] = match emu.bus.cart.backup_type {
                 GbaBackupType::Sram => &mut emu.bus.cart.sram,
                 GbaBackupType::Flash64k | GbaBackupType::Flash128k => &mut emu.bus.cart.flash,
-                GbaBackupType::Eeprom => &mut emu.bus.cart.eeprom,
+                GbaBackupType::Eeprom => {
+                    if let Some(addr_len) = emu.bus.cart.forced_eeprom_addr_len() {
+                        emu.bus.cart.eeprom_addr_len = addr_len;
+                        let size = emu.bus.cart.eeprom_size();
+                        &mut emu.bus.cart.eeprom[..size]
+                    } else {
+                        emu.bus.cart.eeprom_addr_len = if data.len() > 0x200 { 14 } else { 6 };
+                        let size = emu.bus.cart.eeprom_size();
+                        &mut emu.bus.cart.eeprom[..size]
+                    }
+                }
                 GbaBackupType::None => return,
             };
             let len = data.len().min(target.len());
@@ -222,9 +295,37 @@ pub fn load_gba_state(rom_path: &Path, slot: u8) -> Result<GbaEmulator, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{repair_gba_palette_state_if_needed, GBA_PALETTE_BANK_SIZE, GBA_PALETTE_RAM_SIZE};
+    use super::{
+        bank_is_informatively_duplicated_low_halfwords,
+        gba_backup_is_incomplete_pokemon_flash_save,
+        repair_gba_palette_state_if_needed,
+        GBA_FLASH_SECTOR_SIZE,
+        GBA_PALETTE_BANK_SIZE,
+        GBA_PALETTE_RAM_SIZE,
+        POKEMON_GBA_SAVE_SIGNATURE,
+    };
     use crate::cartridge::GbaCartridge;
     use crate::emulator::gba::GbaEmulator;
+
+    #[test]
+    fn duplicated_bank_detector_ignores_zeroed_bank() {
+        assert!(!bank_is_informatively_duplicated_low_halfwords(
+            &[0; GBA_PALETTE_BANK_SIZE]
+        ));
+    }
+
+    #[test]
+    fn duplicated_bank_detector_accepts_varied_duplicated_bank() {
+        let mut bank = [0u8; GBA_PALETTE_BANK_SIZE];
+        for (index, value) in [0x530E_u16, 0x4AFB, 0x212D, 0x7FFF].into_iter().enumerate() {
+            let offset = index * 4;
+            let bytes = value.to_le_bytes();
+            bank[offset..offset + 2].copy_from_slice(&bytes);
+            bank[offset + 2..offset + 4].copy_from_slice(&bytes);
+        }
+
+        assert!(bank_is_informatively_duplicated_low_halfwords(&bank));
+    }
 
     #[test]
     fn gba_state_palette_repair_restores_duplicated_banks() {
@@ -263,5 +364,34 @@ mod tests {
             &emu.bus.ppu.palette[..],
             &emu.bus.ewram[src_start..src_start + GBA_PALETTE_RAM_SIZE]
         );
+    }
+
+    fn write_pokemon_flash_footer(data: &mut [u8], sector: usize, section_id: u16, save_index: u32) {
+        let footer = &mut data[sector * GBA_FLASH_SECTOR_SIZE + GBA_FLASH_SECTOR_SIZE - 12
+            ..sector * GBA_FLASH_SECTOR_SIZE + GBA_FLASH_SECTOR_SIZE];
+        footer[0..2].copy_from_slice(&section_id.to_le_bytes());
+        footer[2..4].copy_from_slice(&0u16.to_le_bytes());
+        footer[4..8].copy_from_slice(&POKEMON_GBA_SAVE_SIGNATURE.to_le_bytes());
+        footer[8..12].copy_from_slice(&save_index.to_le_bytes());
+    }
+
+    #[test]
+    fn gba_flash_pokemon_complete_section_set_is_not_flagged_incomplete() {
+        let mut data = vec![0xFF; 0x20000];
+        for section_id in 0..14u16 {
+            write_pokemon_flash_footer(&mut data, section_id as usize, section_id, 7);
+        }
+
+        assert!(!gba_backup_is_incomplete_pokemon_flash_save(&data));
+    }
+
+    #[test]
+    fn gba_flash_pokemon_incomplete_section_set_is_flagged() {
+        let mut data = vec![0xFF; 0x20000];
+        for (sector, section_id) in [(6usize, 13u16), (7, 0), (16, 9), (17, 10), (18, 11), (19, 12), (20, 5), (21, 6), (22, 7), (23, 8)] {
+            write_pokemon_flash_footer(&mut data, sector, section_id, 1);
+        }
+
+        assert!(gba_backup_is_incomplete_pokemon_flash_save(&data));
     }
 }

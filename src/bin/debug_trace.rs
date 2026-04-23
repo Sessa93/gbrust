@@ -127,10 +127,10 @@ fn main() {
     if remaining.get(arg_index).map(String::as_str) == Some("--frames") {
         target_frames = remaining
             .get(arg_index + 1)
-            .and_then(|value| value.parse().ok());
+            .and_then(|value| value.parse::<u64>().ok());
         arg_index += 2;
     } else if let Some(value) = remaining.get(arg_index) {
-        if let Ok(cycles) = value.parse() {
+        if let Ok(cycles) = value.parse::<u64>() {
             target_cycles = cycles;
             arg_index += 1;
         }
@@ -150,11 +150,11 @@ fn main() {
         };
         if let Some(frame) = remaining
             .get(arg_index + 1)
-            .and_then(|value| value.parse().ok())
+            .and_then(|value| value.parse::<u64>().ok())
         {
             let len = remaining
                 .get(arg_index + 2)
-                .and_then(|value| value.parse().ok())
+                .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(2);
             scripted_presses.push((key, frame, len));
         }
@@ -234,8 +234,6 @@ fn main() {
         GbaEmulator::new(cart)
     };
 
-    // Run until stuck or interesting, then trace
-    const CYCLES_PER_FRAME: u32 = 280896;
     let mut total_cycles: u64 = 0;
     
     if let Some(frames) = target_frames {

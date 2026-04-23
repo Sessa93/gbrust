@@ -66,7 +66,9 @@ impl GbaPpu {
             oam: vec![0; 0x400],
             dispcnt: 0,
             dispstat: 0,
-            vcount: 0,
+            // Start in VBlank so early buffered DISPSTAT writes can latch
+            // before a game has installed its first VBlank callback.
+            vcount: 161,
             bgcnt: [0; 4],
             bghofs: [0; 4],
             bgvofs: [0; 4],
@@ -601,20 +603,12 @@ impl GbaPpu {
         }
     }
 
-    fn palette_color(&self, offset: usize) -> u32 {
-        Self::rgb555_to_argb(self.raw_palette_color(offset))
-    }
-
     fn raw_palette_color(&self, offset: usize) -> u16 {
         if offset + 1 < self.palette.len() {
             (self.palette[offset] as u16) | ((self.palette[offset + 1] as u16) << 8)
         } else {
             0
         }
-    }
-
-    fn sprite_palette_color(&self, offset: usize) -> u32 {
-        Self::rgb555_to_argb(self.raw_sprite_palette_color(offset))
     }
 
     fn raw_sprite_palette_color(&self, offset: usize) -> u16 {

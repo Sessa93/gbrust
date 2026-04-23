@@ -1,6 +1,7 @@
 pub mod mbc;
 
 use serde::{Deserialize, Serialize};
+use time::{Duration, OffsetDateTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CartridgeType {
@@ -140,6 +141,49 @@ pub enum GbaBackupType {
     Eeprom,
 }
 
+const GPIO_REG_DATA: u32 = 0xC4;
+const GPIO_REG_DIRECTION: u32 = 0xC6;
+const GPIO_REG_CONTROL: u32 = 0xC8;
+
+const RTC_BYTES: [i32; 8] = [0, 0, 7, 0, 1, 0, 3, 0];
+const RTC_COMMAND_MAGIC: u8 = 0x06;
+const RTC_CONTROL_24_HOUR: u8 = 0x40;
+
+const RTC_PIN_SCK: u8 = 1 << 0;
+const RTC_PIN_SIO: u8 = 1 << 1;
+const RTC_PIN_CS: u8 = 1 << 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GbaRtc {
+    pub bytes_remaining: i32,
+    pub bits_read: u8,
+    pub bits: u8,
+    pub command_active: bool,
+    pub sck_edge: bool,
+    pub sio_output: bool,
+    pub command: u8,
+    pub control: u8,
+    pub time: [u8; 7],
+    pub offset_seconds: i64,
+}
+
+impl Default for GbaRtc {
+    fn default() -> Self {
+        Self {
+            bytes_remaining: 0,
+            bits_read: 0,
+            bits: 0,
+            command_active: false,
+            sck_edge: true,
+            sio_output: true,
+            command: 0,
+            control: RTC_CONTROL_24_HOUR,
+            time: [0; 7],
+            offset_seconds: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GbaCartridge {
     pub rom: Vec<u8>,
@@ -161,6 +205,12 @@ pub struct GbaCartridge {
     pub eeprom_read_buffer: u64,
     pub eeprom_addr_len: u8, // 6 or 14 bits
     eeprom_command: EepromCommand,
+    pub has_rtc: bool,
+    pub gpio_read_write: bool,
+    pub gpio_write_latch: u8,
+    pub gpio_pin_state: u8,
+    pub gpio_direction: u8,
+    pub rtc: GbaRtc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,7 +239,9 @@ impl GbaCartridge {
             .map(|&b| b as char)
             .collect();
 
-        let backup_type = Self::detect_backup_type(&data);
+        let text = String::from_utf8_lossy(&data);
+        let backup_type = Self::detect_backup_type(&text);
+        let has_rtc = text.contains("RTC_V");
 
         let (sram, flash, eeprom) = match backup_type {
             GbaBackupType::Sram => (vec![0xFF; 0x8000], vec![], vec![]),
@@ -219,11 +271,16 @@ impl GbaCartridge {
             // The actual EEPROM size is determined from DMA transfer lengths.
             eeprom_addr_len: 6,
             eeprom_command: EepromCommand::None,
+            has_rtc,
+            gpio_read_write: false,
+            gpio_write_latch: 0,
+            gpio_pin_state: 0,
+            gpio_direction: 0,
+            rtc: GbaRtc::default(),
         }
     }
 
-    fn detect_backup_type(data: &[u8]) -> GbaBackupType {
-        let text = String::from_utf8_lossy(data);
+    fn detect_backup_type(text: &str) -> GbaBackupType {
         if text.contains("SRAM_V") || text.contains("SRAM_F_V") {
             GbaBackupType::Sram
         } else if text.contains("FLASH1M_V") {
@@ -242,6 +299,11 @@ impl GbaCartridge {
             return;
         }
 
+        if let Some(addr_len) = self.forced_eeprom_addr_len() {
+            self.eeprom_addr_len = addr_len;
+            return;
+        }
+
         match transfer_count {
             9 | 73 => self.eeprom_addr_len = 6,
             17 | 81 => self.eeprom_addr_len = 14,
@@ -249,8 +311,41 @@ impl GbaCartridge {
         }
     }
 
+    pub fn eeprom_size(&self) -> usize {
+        if let Some(addr_len) = self.forced_eeprom_addr_len() {
+            return match addr_len {
+                6 => 0x200,
+                14 => 0x2000,
+                _ => 0x200,
+            };
+        }
+
+        match self.eeprom_addr_len {
+            6 => 0x200,
+            14 => 0x2000,
+            _ => 0x200,
+        }
+    }
+
+    pub fn forced_eeprom_addr_len(&self) -> Option<u8> {
+        match self.rom.get(0xAC..0xB0).and_then(|bytes| std::str::from_utf8(bytes).ok()) {
+            Some("AA2E") => Some(14),
+            _ => None,
+        }
+    }
+
     pub fn read_rom(&self, addr: u32) -> u8 {
         let offset = (addr & 0x01FF_FFFF) as usize;
+        if self.has_rtc && self.gpio_read_write {
+            if let Some(register) = Self::gpio_register(addr) {
+                let value = self.read_gpio_register(register);
+                return if addr & 1 == 0 {
+                    value as u8
+                } else {
+                    (value >> 8) as u8
+                };
+            }
+        }
         if offset < self.rom.len() {
             self.rom[offset]
         } else {
@@ -258,13 +353,30 @@ impl GbaCartridge {
         }
     }
 
+    pub fn write_rom(&mut self, addr: u32, val: u8) -> bool {
+        if !self.has_rtc {
+            return false;
+        }
+
+        let Some(register) = Self::gpio_register(addr) else {
+            return false;
+        };
+
+        let shift = ((addr & 1) * 8) as u16;
+        let mask = !(0x00FFu16 << shift);
+        let value = (self.read_gpio_register(register) & mask) | ((val as u16) << shift);
+        self.write_gpio_register(register, value);
+        true
+    }
+
     pub fn read_sram(&self, addr: u32) -> u8 {
-        let offset = (addr & 0x7FFF) as usize;
         match self.backup_type {
             GbaBackupType::Sram => {
+                let offset = (addr & 0x7FFF) as usize;
                 if offset < self.sram.len() { self.sram[offset] } else { 0xFF }
             }
             GbaBackupType::Flash64k | GbaBackupType::Flash128k => {
+                let offset = (addr & 0xFFFF) as usize;
                 if self.flash_id_mode {
                     match offset {
                         0 => 0x62, // Macronix manufacturer
@@ -281,14 +393,15 @@ impl GbaCartridge {
     }
 
     pub fn write_sram(&mut self, addr: u32, val: u8) {
-        let offset = (addr & 0x7FFF) as usize;
         match self.backup_type {
             GbaBackupType::Sram => {
+                let offset = (addr & 0x7FFF) as usize;
                 if offset < self.sram.len() {
                     self.sram[offset] = val;
                 }
             }
             GbaBackupType::Flash64k | GbaBackupType::Flash128k => {
+                let offset = (addr & 0xFFFF) as usize;
                 self.handle_flash_write(offset, val);
             }
             _ => {}
@@ -473,5 +586,184 @@ impl GbaCartridge {
                 self.eeprom_command = EepromCommand::None;
             }
         }
+    }
+
+    fn gpio_register(addr: u32) -> Option<u32> {
+        match (addr & 0x01FF_FFFF) & !1 {
+            GPIO_REG_DATA | GPIO_REG_DIRECTION | GPIO_REG_CONTROL => Some((addr & 0x01FF_FFFF) & !1),
+            _ => None,
+        }
+    }
+
+    fn read_gpio_register(&self, register: u32) -> u16 {
+        match register {
+            GPIO_REG_DATA => self.gpio_pin_state as u16,
+            GPIO_REG_DIRECTION => self.gpio_direction as u16,
+            GPIO_REG_CONTROL => u16::from(self.gpio_read_write),
+            _ => 0,
+        }
+    }
+
+    fn write_gpio_register(&mut self, register: u32, value: u16) {
+        match register {
+            GPIO_REG_DATA => {
+                self.gpio_write_latch = (value as u8) & 0x0F;
+                self.gpio_pin_state &= !self.gpio_direction;
+                self.gpio_pin_state |= self.gpio_write_latch & self.gpio_direction;
+                self.rtc_read_pins();
+            }
+            GPIO_REG_DIRECTION => {
+                self.gpio_direction = (value as u8) & 0x0F;
+                self.gpio_pin_state &= !self.gpio_direction;
+                self.gpio_pin_state |= self.gpio_write_latch & self.gpio_direction;
+                self.rtc_read_pins();
+            }
+            GPIO_REG_CONTROL => {
+                self.gpio_read_write = value & 1 != 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn rtc_read_pins(&mut self) {
+        self.rtc_output_pins(self.gpio_pin_state & RTC_PIN_SIO);
+
+        if self.gpio_pin_state & RTC_PIN_CS == 0 {
+            self.rtc.bits_read = 0;
+            self.rtc.bytes_remaining = 0;
+            self.rtc.command_active = false;
+            self.rtc.command = 0;
+            self.rtc.sck_edge = true;
+            self.rtc.sio_output = true;
+            self.rtc_output_pins(RTC_PIN_SIO);
+            return;
+        }
+
+        if !self.rtc.command_active {
+            self.rtc_output_pins(RTC_PIN_SIO);
+            if self.gpio_pin_state & RTC_PIN_SCK == 0 {
+                self.rtc.bits &= !(1 << self.rtc.bits_read);
+                self.rtc.bits |= ((self.gpio_pin_state & RTC_PIN_SIO) >> 1) << self.rtc.bits_read;
+            }
+            if !self.rtc.sck_edge && self.gpio_pin_state & RTC_PIN_SCK != 0 {
+                self.rtc.bits_read += 1;
+                if self.rtc.bits_read == 8 {
+                    self.rtc_begin_command();
+                }
+            }
+        } else if !Self::rtc_command_is_reading(self.rtc.command) {
+            self.rtc_output_pins(RTC_PIN_SIO);
+            if self.gpio_pin_state & RTC_PIN_SCK == 0 {
+                self.rtc.bits &= !(1 << self.rtc.bits_read);
+                self.rtc.bits |= ((self.gpio_pin_state & RTC_PIN_SIO) >> 1) << self.rtc.bits_read;
+            }
+            if !self.rtc.sck_edge && self.gpio_pin_state & RTC_PIN_SCK != 0 {
+                let incoming = (self.gpio_pin_state & RTC_PIN_SIO) >> 1;
+                if ((self.rtc.bits >> self.rtc.bits_read) & 1) ^ incoming != 0 {
+                    self.rtc.bits &= !(1 << self.rtc.bits_read);
+                }
+                self.rtc.bits_read += 1;
+                if self.rtc.bits_read == 8 {
+                    self.rtc_process_byte();
+                }
+            }
+        } else {
+            if self.rtc.sck_edge && self.gpio_pin_state & RTC_PIN_SCK == 0 {
+                self.rtc.sio_output = self.rtc_output_bit();
+                self.rtc.bits_read += 1;
+                if self.rtc.bits_read == 8 {
+                    self.rtc.bytes_remaining -= 1;
+                    if self.rtc.bytes_remaining <= 0 {
+                        self.rtc.bytes_remaining = RTC_BYTES[Self::rtc_command_index(self.rtc.command)];
+                    }
+                    self.rtc.bits_read = 0;
+                }
+            }
+            self.rtc_output_pins((self.rtc.sio_output as u8) << 1);
+        }
+
+        self.rtc.sck_edge = self.gpio_pin_state & RTC_PIN_SCK != 0;
+    }
+
+    fn rtc_begin_command(&mut self) {
+        let command = self.rtc.bits;
+        if Self::rtc_command_magic(command) == RTC_COMMAND_MAGIC {
+            self.rtc.command = command;
+            self.rtc.bytes_remaining = RTC_BYTES[Self::rtc_command_index(command)];
+            self.rtc.command_active = true;
+            match Self::rtc_command_index(command) {
+                0 => self.rtc.control = 0,
+                2 | 6 => self.rtc_update_clock(),
+                _ => {}
+            }
+        } else {
+            self.rtc.command_active = false;
+        }
+
+        self.rtc.bits = 0;
+        self.rtc.bits_read = 0;
+    }
+
+    fn rtc_process_byte(&mut self) {
+        if Self::rtc_command_index(self.rtc.command) == 4 {
+            self.rtc.control = self.rtc.bits;
+        }
+
+        self.rtc.bits = 0;
+        self.rtc.bits_read = 0;
+        self.rtc.bytes_remaining -= 1;
+        if self.rtc.bytes_remaining <= 0 {
+            self.rtc.bytes_remaining = RTC_BYTES[Self::rtc_command_index(self.rtc.command)];
+        }
+    }
+
+    fn rtc_output_bit(&self) -> bool {
+        let output = match Self::rtc_command_index(self.rtc.command) {
+            4 => self.rtc.control,
+            2 | 6 => self.rtc.time[7 - self.rtc.bytes_remaining as usize],
+            _ => 0xFF,
+        };
+        ((output >> self.rtc.bits_read) & 1) != 0
+    }
+
+    fn rtc_update_clock(&mut self) {
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc())
+            - Duration::seconds(self.rtc.offset_seconds);
+
+        let year = now.year().saturating_sub(2000).clamp(0, 99) as u8;
+        let hour = if self.rtc.control & RTC_CONTROL_24_HOUR != 0 {
+            now.hour()
+        } else {
+            now.hour() % 12
+        };
+
+        self.rtc.time[0] = Self::to_bcd(year);
+        self.rtc.time[1] = Self::to_bcd(now.month() as u8);
+        self.rtc.time[2] = Self::to_bcd(now.day());
+        self.rtc.time[3] = Self::to_bcd(now.weekday().number_days_from_sunday());
+        self.rtc.time[4] = Self::to_bcd(hour);
+        self.rtc.time[5] = Self::to_bcd(now.minute());
+        self.rtc.time[6] = Self::to_bcd(now.second());
+    }
+
+    fn rtc_output_pins(&mut self, pins: u8) {
+        self.gpio_pin_state &= self.gpio_direction;
+        self.gpio_pin_state |= pins & !self.gpio_direction & 0x0F;
+    }
+
+    fn rtc_command_magic(command: u8) -> u8 {
+        command & 0x0F
+    }
+
+    fn rtc_command_index(command: u8) -> usize {
+        ((command >> 4) & 0x07) as usize
+    }
+
+    fn rtc_command_is_reading(command: u8) -> bool {
+        command & 0x80 != 0
+    }
+
+    fn to_bcd(value: u8) -> u8 {
+        ((value / 10) << 4) | (value % 10)
     }
 }
