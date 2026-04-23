@@ -462,6 +462,27 @@ impl EmuApp {
         !matches!(self.emu, Emulator::None)
     }
 
+    fn pause_button_label(&self) -> &'static str {
+        if self.paused { "Resume" } else { "Pause" }
+    }
+
+    fn pause_action_label(&self) -> &'static str {
+        if self.paused {
+            "Resume Emulation"
+        } else {
+            "Pause Emulation"
+        }
+    }
+
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        self.status_msg = if self.paused {
+            "Emulation paused.".to_string()
+        } else {
+            "Emulation resumed.".to_string()
+        };
+    }
+
     fn key_legend(&self) -> &'static str {
         match self.emu {
             Emulator::Gba(_) => {
@@ -486,6 +507,14 @@ impl EmuApp {
                 Emulator::Gba(emu) => save::save_gba_backup(path, emu),
                 Emulator::None => {}
             }
+        }
+    }
+
+    fn auto_save_due(&self) -> bool {
+        match &self.emu {
+            Emulator::Gbc(emu) => emu.total_frames != 0 && emu.total_frames % 60 == 0,
+            Emulator::Gba(emu) => emu.total_frames != 0 && emu.total_frames % 60 == 0,
+            Emulator::None => false,
         }
     }
 
@@ -735,18 +764,10 @@ impl EmuApp {
                 }
 
                 if ui
-                    .add_enabled(
-                        has_rom,
-                        egui::Button::new(if self.paused { "Resume" } else { "Pause" }),
-                    )
+                    .add_enabled(has_rom, egui::Button::new(self.pause_button_label()))
                     .clicked()
                 {
-                    self.paused = !self.paused;
-                    self.status_msg = if self.paused {
-                        "Emulation paused.".to_string()
-                    } else {
-                        "Emulation resumed.".to_string()
-                    };
+                    self.toggle_pause();
                 }
 
                 if ui.add_enabled(has_rom, egui::Button::new("Reset")).clicked() {
@@ -804,17 +825,10 @@ impl EmuApp {
                     }
 
                     if ui
-                        .add_enabled(
-                            has_rom,
-                            egui::Button::new(if self.paused {
-                                "Resume Emulation"
-                            } else {
-                                "Pause Emulation"
-                            }),
-                        )
+                        .add_enabled(has_rom, egui::Button::new(self.pause_action_label()))
                         .clicked()
                     {
-                        self.paused = !self.paused;
+                        self.toggle_pause();
                     }
 
                     if ui.add_enabled(has_rom, egui::Button::new("Reset ROM")).clicked() {
@@ -1063,20 +1077,8 @@ impl eframe::App for EmuApp {
             ctx.request_repaint();
         }
 
-        if let (Some(path), false) = (&self.rom_path, self.paused) {
-            match &self.emu {
-                Emulator::Gbc(emu) => {
-                    if emu.total_frames % 60 == 0 {
-                        save::save_gbc_sram(path, emu);
-                    }
-                }
-                Emulator::Gba(emu) => {
-                    if emu.total_frames % 60 == 0 {
-                        save::save_gba_backup(path, emu);
-                    }
-                }
-                Emulator::None => {}
-            }
+        if !self.paused && self.auto_save_due() {
+            self.save_backup();
         }
 
         if !matches!(self.emu, Emulator::None) && !self.paused {
