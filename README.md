@@ -2,6 +2,8 @@
 
 A Game Boy Color and Game Boy Advance emulator written in Rust.
 
+![gbrust desktop UI](resources/screenshots/main-1.png)
+
 ## Features
 
 - **Dual-console support** — plays both GBC (`.gb`/`.gbc`) and GBA (`.gba`) ROMs, auto-detected by file extension
@@ -12,7 +14,7 @@ A Game Boy Color and Game Boy Advance emulator written in Rust.
 - **Audio** — square, wave, and noise channels (GBC); DirectSound FIFO A/B (GBA); real-time output via cpal
 - **Memory** — MBC1/MBC3/MBC5 mappers, VRAM banking, OAM DMA, HDMA, GBA DMA (4 channels)
 - **Save system** — battery-backed SRAM/Flash/EEPROM auto-save + 5 save-state slots (bincode serialization)
-- **GUI** — eframe/egui window with menu bar, ROM file picker, aspect-ratio-correct rendering
+- **GUI** — eframe/egui desktop frontend with a top control bar, resizable sidebar, display tuning, animated shell overlay, and aspect-ratio-correct rendering
 - **Input** — keyboard mapping (Z/X = A/B, Arrows = D-Pad, Enter = Start, Backspace = Select, A/S = L/R)
 
 ## Building
@@ -29,7 +31,9 @@ cargo build --release
 cargo run --release
 ```
 
-Use **File → Open ROM** to load a `.gb`, `.gbc`, or `.gba` file.
+Use **Open ROM** in the top bar to load a `.gb`, `.gbc`, or `.gba` file.
+
+The desktop frontend provides quick access to ROM loading, pause/reset controls, save states, audio volume, display grading, and a live FPS readout.
 
 ## Controls
 
@@ -46,7 +50,7 @@ Use **File → Open ROM** to load a `.gb`, `.gbc`, or `.gba` file.
 ## Save & Load
 
 - SRAM is auto-saved alongside the ROM file every ~1 second of gameplay
-- **Save State / Load State** via the menu bar (slots 1–5)
+- **Save State / Load State** via the sidebar (slots 1–5)
 
 ## Testing
 

@@ -257,6 +257,9 @@ pub struct EmuApp {
     paused: bool,
     last_frame_time: Instant,
     frame_accumulator: Duration,
+    fps_sample_time: Duration,
+    fps_sample_frames: u32,
+    displayed_fps: f32,
     button_animation: [f32; OverlayButton::COUNT],
 }
 
@@ -303,6 +306,9 @@ impl EmuApp {
             paused: false,
             last_frame_time: Instant::now(),
             frame_accumulator: Duration::ZERO,
+            fps_sample_time: Duration::ZERO,
+            fps_sample_frames: 0,
+            displayed_fps: 0.0,
             button_animation: [0.0; OverlayButton::COUNT],
         }
     }
@@ -400,6 +406,30 @@ impl EmuApp {
     fn reset_timing(&mut self) {
         self.last_frame_time = Instant::now();
         self.frame_accumulator = Duration::ZERO;
+        self.fps_sample_time = Duration::ZERO;
+        self.fps_sample_frames = 0;
+        self.displayed_fps = 0.0;
+    }
+
+    fn update_fps(&mut self, elapsed: Duration, frames_run: u32) {
+        if !self.has_rom_loaded() || self.paused {
+            self.fps_sample_time = Duration::ZERO;
+            self.fps_sample_frames = 0;
+            self.displayed_fps = 0.0;
+            return;
+        }
+
+        self.fps_sample_time += elapsed;
+        self.fps_sample_frames += frames_run;
+
+        if self.fps_sample_time >= Duration::from_millis(250) {
+            let seconds = self.fps_sample_time.as_secs_f32();
+            if seconds > 0.0 {
+                self.displayed_fps = self.fps_sample_frames as f32 / seconds;
+            }
+            self.fps_sample_time = Duration::ZERO;
+            self.fps_sample_frames = 0;
+        }
     }
 
     fn rom_name(&self) -> String {
@@ -890,6 +920,12 @@ impl EmuApp {
                 ui.label(&self.status_msg);
                 ui.separator();
                 ui.label(format!("{} | {}", self.console_name(), self.resolution_label()));
+                ui.separator();
+                if self.has_rom_loaded() {
+                    ui.label(format!("FPS {:.1}", self.displayed_fps));
+                } else {
+                    ui.label("FPS --");
+                }
             });
         });
     }
@@ -974,6 +1010,7 @@ impl eframe::App for EmuApp {
         let elapsed = now.duration_since(self.last_frame_time);
         self.last_frame_time = now;
         let button_animation_changed = self.update_button_animation(ctx, elapsed);
+        let mut frames_run = 0;
 
         if self.paused || matches!(self.emu, Emulator::None) {
             self.frame_accumulator = Duration::ZERO;
@@ -984,7 +1021,6 @@ impl eframe::App for EmuApp {
             self.frame_accumulator = (self.frame_accumulator + elapsed).min(max_accumulator);
 
             let mut latest_framebuffer: Option<Vec<u32>> = None;
-            let mut frames_run = 0;
 
             while self.frame_accumulator >= FRAME_DURATION && frames_run < MAX_CATCH_UP_FRAMES {
                 self.frame_accumulator -= FRAME_DURATION;
@@ -1014,6 +1050,8 @@ impl eframe::App for EmuApp {
                 self.update_screen_texture(ctx, framebuffer);
             }
         }
+
+        self.update_fps(elapsed, frames_run);
 
         self.draw_screen(ctx, &mut open_rom);
 
