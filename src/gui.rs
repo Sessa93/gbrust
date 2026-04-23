@@ -18,6 +18,118 @@ enum Emulator {
     Gba(GbaEmulator),
 }
 
+impl Emulator {
+    fn is_loaded(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn console_name(&self) -> &'static str {
+        match self {
+            Self::Gbc(_) => "Game Boy Color",
+            Self::Gba(_) => "Game Boy Advance",
+            Self::None => "No console",
+        }
+    }
+
+    fn key_legend(&self) -> &'static str {
+        match self {
+            Self::Gba(_) => {
+                "Z/X = A/B, Enter = Start, Backspace = Select, Arrows = D-Pad, A/S = L/R"
+            }
+            Self::Gbc(_) | Self::None => {
+                "Z/X = A/B, Enter = Start, Backspace = Select, Arrows = D-Pad"
+            }
+        }
+    }
+
+    fn total_frames(&self) -> Option<u64> {
+        match self {
+            Self::Gbc(emu) => Some(emu.total_frames),
+            Self::Gba(emu) => Some(emu.total_frames),
+            Self::None => None,
+        }
+    }
+
+    fn run_frame(&mut self) -> Option<(Vec<u32>, Vec<f32>)> {
+        match self {
+            Self::Gbc(emu) => Some((emu.run_frame().to_vec(), emu.audio_buffer())),
+            Self::Gba(emu) => Some((emu.run_frame().to_vec(), emu.audio_buffer())),
+            Self::None => None,
+        }
+    }
+
+    fn screen_dimensions(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Gbc(emu) => Some((emu.screen_width() as usize, emu.screen_height() as usize)),
+            Self::Gba(emu) => Some((emu.screen_width() as usize, emu.screen_height() as usize)),
+            Self::None => None,
+        }
+    }
+
+    fn apply_key_map<K: Copy>(
+        input: &egui::InputState,
+        map: &[(egui::Key, K)],
+        mut apply: impl FnMut(K, bool),
+    ) {
+        for &(egui_key, emu_key) in map {
+            if input.key_pressed(egui_key) {
+                apply(emu_key, true);
+            }
+            if input.key_released(egui_key) {
+                apply(emu_key, false);
+            }
+        }
+    }
+
+    fn handle_input(&mut self, input: &egui::InputState) {
+        match self {
+            Self::Gbc(emu) => {
+                Self::apply_key_map(input, &GBC_KEY_MAP, |key, pressed| {
+                    if pressed {
+                        emu.bus.input.key_down(key);
+                    } else {
+                        emu.bus.input.key_up(key);
+                    }
+                });
+            }
+            Self::Gba(emu) => {
+                Self::apply_key_map(input, &GBA_KEY_MAP, |key, pressed| {
+                    if pressed {
+                        emu.bus.input.key_down(key);
+                    } else {
+                        emu.bus.input.key_up(key);
+                    }
+                });
+            }
+            Self::None => {}
+        }
+    }
+
+    fn save_backup(&self, path: &Path) {
+        match self {
+            Self::Gbc(emu) => save::save_gbc_sram(path, emu),
+            Self::Gba(emu) => save::save_gba_backup(path, emu),
+            Self::None => {}
+        }
+    }
+
+    fn save_state(&self, path: &Path, slot: u8) -> Result<(), String> {
+        match self {
+            Self::Gbc(emu) => save::save_gbc_state(path, slot, emu),
+            Self::Gba(emu) => save::save_gba_state(path, slot, emu),
+            Self::None => Ok(()),
+        }
+    }
+
+    fn load_state(&self, path: &Path, slot: u8) -> Result<Option<Self>, String> {
+        match self {
+            Self::Gbc(_) => save::load_gbc_state(path, slot).map(Self::Gbc).map(Some),
+            Self::Gba(_) => save::load_gba_state(path, slot).map(Self::Gba).map(Some),
+            Self::None => Ok(None),
+        }
+    }
+}
+
 const FRAME_DURATION: Duration = Duration::from_nanos(16_742_706);
 const MAX_AUDIO_BUFFER_SAMPLES: usize = 8192;
 const MAX_CATCH_UP_FRAMES: u32 = 4;
@@ -469,11 +581,7 @@ impl EmuApp {
     }
 
     fn console_name(&self) -> &'static str {
-        match self.emu {
-            Emulator::Gbc(_) => "Game Boy Color",
-            Emulator::Gba(_) => "Game Boy Advance",
-            Emulator::None => "No console",
-        }
+        self.emu.console_name()
     }
 
     fn resolution_label(&self) -> String {
@@ -481,7 +589,7 @@ impl EmuApp {
     }
 
     fn has_rom_loaded(&self) -> bool {
-        !matches!(self.emu, Emulator::None)
+        self.emu.is_loaded()
     }
 
     fn pause_button_label(&self) -> &'static str {
@@ -506,12 +614,7 @@ impl EmuApp {
     }
 
     fn key_legend(&self) -> &'static str {
-        match self.emu {
-            Emulator::Gba(_) => {
-                "Z/X = A/B, Enter = Start, Backspace = Select, Arrows = D-Pad, A/S = L/R"
-            }
-            _ => "Z/X = A/B, Enter = Start, Backspace = Select, Arrows = D-Pad",
-        }
+        self.emu.key_legend()
     }
 
     fn sync_audio_volume(&self) {
@@ -524,20 +627,12 @@ impl EmuApp {
 
     fn save_backup(&self) {
         if let Some(path) = self.rom_path.as_deref() {
-            match &self.emu {
-                Emulator::Gbc(emu) => save::save_gbc_sram(path, emu),
-                Emulator::Gba(emu) => save::save_gba_backup(path, emu),
-                Emulator::None => {}
-            }
+            self.emu.save_backup(path);
         }
     }
 
     fn auto_save_due(&self) -> bool {
-        match &self.emu {
-            Emulator::Gbc(emu) => emu.total_frames != 0 && emu.total_frames % 60 == 0,
-            Emulator::Gba(emu) => emu.total_frames != 0 && emu.total_frames % 60 == 0,
-            Emulator::None => false,
-        }
+        matches!(self.emu.total_frames(), Some(total_frames) if total_frames != 0 && total_frames % 60 == 0)
     }
 
     fn open_rom_dialog(&mut self) {
@@ -555,9 +650,17 @@ impl EmuApp {
         self.texture = None;
         self.last_framebuffer = None;
         self.paused = false;
+        self.sync_screen_dimensions();
         self.setup_audio();
         self.sync_audio_volume();
         self.reset_timing();
+    }
+
+    fn sync_screen_dimensions(&mut self) {
+        if let Some((width, height)) = self.emu.screen_dimensions() {
+            self.screen_width = width;
+            self.screen_height = height;
+        }
     }
 
     fn load_rom(&mut self, path: PathBuf) {
@@ -586,8 +689,6 @@ impl EmuApp {
                 let cart = GbcCartridge::load(rom_data);
                 let mut emu = GbcEmulator::new(cart);
                 save::load_gbc_sram(&path, &mut emu);
-                self.screen_width = crate::GBC_WIDTH;
-                self.screen_height = crate::GBC_HEIGHT;
                 self.emu = Emulator::Gbc(emu);
                 "GBC"
             }
@@ -595,8 +696,6 @@ impl EmuApp {
                 let cart = GbaCartridge::load(rom_data);
                 let mut emu = GbaEmulator::new(cart);
                 save::load_gba_backup(&path, &mut emu);
-                self.screen_width = crate::GBA_WIDTH;
-                self.screen_height = crate::GBA_HEIGHT;
                 self.emu = Emulator::Gba(emu);
                 "GBA"
             }
@@ -661,51 +760,8 @@ impl EmuApp {
         });
     }
 
-    fn apply_key_map<K: Copy>(
-        input: &egui::InputState,
-        map: &[(egui::Key, K)],
-        mut apply: impl FnMut(K, bool),
-    ) {
-        for &(egui_key, emu_key) in map {
-            if input.key_pressed(egui_key) {
-                apply(emu_key, true);
-            }
-            if input.key_released(egui_key) {
-                apply(emu_key, false);
-            }
-        }
-    }
-
     fn handle_input(&mut self, ctx: &egui::Context) {
-        ctx.input(|input| match &mut self.emu {
-            Emulator::Gbc(emu) => {
-                Self::apply_key_map(
-                    input,
-                    &GBC_KEY_MAP,
-                    |key, pressed| {
-                        if pressed {
-                            emu.bus.input.key_down(key);
-                        } else {
-                            emu.bus.input.key_up(key);
-                        }
-                    },
-                );
-            }
-            Emulator::Gba(emu) => {
-                Self::apply_key_map(
-                    input,
-                    &GBA_KEY_MAP,
-                    |key, pressed| {
-                        if pressed {
-                            emu.bus.input.key_down(key);
-                        } else {
-                            emu.bus.input.key_up(key);
-                        }
-                    },
-                );
-            }
-            Emulator::None => {}
-        });
+        ctx.input(|input| self.emu.handle_input(input));
     }
 
     fn save_state(&mut self) {
@@ -724,6 +780,7 @@ impl EmuApp {
             match self.load_state_from_slot(path) {
                 Ok(Some(emu)) => {
                     self.emu = emu;
+                    self.sync_screen_dimensions();
                     self.reset_timing();
                     self.status_msg = format!("State loaded from slot {}", self.save_slot);
                 }
@@ -736,27 +793,11 @@ impl EmuApp {
     }
 
     fn save_state_to_slot(&self, path: &Path) -> Result<(), String> {
-        match &self.emu {
-            Emulator::Gbc(emu) => save::save_gbc_state(path, self.save_slot, emu)
-                .map_err(|error| error.to_string()),
-            Emulator::Gba(emu) => save::save_gba_state(path, self.save_slot, emu)
-                .map_err(|error| error.to_string()),
-            Emulator::None => Ok(()),
-        }
+        self.emu.save_state(path, self.save_slot)
     }
 
     fn load_state_from_slot(&self, path: &Path) -> Result<Option<Emulator>, String> {
-        match &self.emu {
-            Emulator::Gbc(_) => save::load_gbc_state(path, self.save_slot)
-                .map(Emulator::Gbc)
-                .map(Some)
-                .map_err(|error| error.to_string()),
-            Emulator::Gba(_) => save::load_gba_state(path, self.save_slot)
-                .map(Emulator::Gba)
-                .map(Some)
-                .map_err(|error| error.to_string()),
-            Emulator::None => Ok(None),
-        }
+        self.emu.load_state(path, self.save_slot)
     }
 
     fn reset_emulator(&mut self) {
@@ -1061,7 +1102,7 @@ impl eframe::App for EmuApp {
         let button_animation_changed = self.update_button_animation(ctx, elapsed);
         let mut frames_run = 0;
 
-        if self.paused || matches!(self.emu, Emulator::None) {
+        if self.paused || !self.emu.is_loaded() {
             self.frame_accumulator = Duration::ZERO;
         } else {
             let max_accumulator = FRAME_DURATION
@@ -1075,10 +1116,8 @@ impl eframe::App for EmuApp {
                 self.frame_accumulator -= FRAME_DURATION;
                 frames_run += 1;
 
-                let (framebuffer, samples) = match &mut self.emu {
-                    Emulator::Gbc(emu) => (emu.run_frame().to_vec(), emu.audio_buffer()),
-                    Emulator::Gba(emu) => (emu.run_frame().to_vec(), emu.audio_buffer()),
-                    Emulator::None => (vec![], vec![]),
+                let Some((framebuffer, samples)) = self.emu.run_frame() else {
+                    break;
                 };
 
                 if let Some(ref audio) = self.audio_stream {
@@ -1116,7 +1155,7 @@ impl eframe::App for EmuApp {
             self.save_backup();
         }
 
-        if !matches!(self.emu, Emulator::None) && !self.paused {
+        if self.emu.is_loaded() && !self.paused {
             if self.frame_accumulator >= FRAME_DURATION {
                 ctx.request_repaint();
             } else {
