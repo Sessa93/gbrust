@@ -29,6 +29,28 @@ const BUTTON_PRESS_IN_SPEED: f32 = 15.0;
 const BUTTON_PRESS_OUT_SPEED: f32 = 11.0;
 const BUTTON_OVERLAY_MAX_ALPHA: f32 = 50.0;
 const BUTTON_OVERLAY_TINT: u8 = 100;
+const GBC_KEY_MAP: [(egui::Key, GbcKey); 8] = [
+    (egui::Key::Z, GbcKey::A),
+    (egui::Key::X, GbcKey::B),
+    (egui::Key::Enter, GbcKey::Start),
+    (egui::Key::Backspace, GbcKey::Select),
+    (egui::Key::ArrowUp, GbcKey::Up),
+    (egui::Key::ArrowDown, GbcKey::Down),
+    (egui::Key::ArrowLeft, GbcKey::Left),
+    (egui::Key::ArrowRight, GbcKey::Right),
+];
+const GBA_KEY_MAP: [(egui::Key, GbaKey); 10] = [
+    (egui::Key::Z, GbaKey::A),
+    (egui::Key::X, GbaKey::B),
+    (egui::Key::Enter, GbaKey::Start),
+    (egui::Key::Backspace, GbaKey::Select),
+    (egui::Key::ArrowUp, GbaKey::Up),
+    (egui::Key::ArrowDown, GbaKey::Down),
+    (egui::Key::ArrowLeft, GbaKey::Left),
+    (egui::Key::ArrowRight, GbaKey::Right),
+    (egui::Key::A, GbaKey::L),
+    (egui::Key::S, GbaKey::R),
+];
 
 #[derive(Clone, Copy)]
 struct DisplaySettings {
@@ -528,12 +550,21 @@ impl EmuApp {
         }
     }
 
+    fn finish_rom_load(&mut self, path: PathBuf) {
+        self.rom_path = Some(path);
+        self.texture = None;
+        self.last_framebuffer = None;
+        self.paused = false;
+        self.setup_audio();
+        self.sync_audio_volume();
+        self.reset_timing();
+    }
+
     fn load_rom(&mut self, path: PathBuf) {
         let ext = path
             .extension()
             .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_string();
+            .unwrap_or_default();
 
         let Some(console) = ConsoleType::from_extension(&ext) else {
             self.status_msg = format!("Unknown file extension: .{}", ext);
@@ -548,7 +579,9 @@ impl EmuApp {
             }
         };
 
-        match console {
+        let rom_name = self.rom_name_from_path(&path);
+
+        let console_name = match console {
             ConsoleType::GameBoyColor => {
                 let cart = GbcCartridge::load(rom_data);
                 let mut emu = GbcEmulator::new(cart);
@@ -556,8 +589,7 @@ impl EmuApp {
                 self.screen_width = crate::GBC_WIDTH;
                 self.screen_height = crate::GBC_HEIGHT;
                 self.emu = Emulator::Gbc(emu);
-                self.status_msg =
-                    format!("Loaded GBC ROM: {}", self.rom_name_from_path(&path));
+                "GBC"
             }
             ConsoleType::GameBoyAdvance => {
                 let cart = GbaCartridge::load(rom_data);
@@ -566,18 +598,12 @@ impl EmuApp {
                 self.screen_width = crate::GBA_WIDTH;
                 self.screen_height = crate::GBA_HEIGHT;
                 self.emu = Emulator::Gba(emu);
-                self.status_msg =
-                    format!("Loaded GBA ROM: {}", self.rom_name_from_path(&path));
+                "GBA"
             }
-        }
+        };
 
-        self.rom_path = Some(path);
-        self.texture = None;
-        self.last_framebuffer = None;
-        self.paused = false;
-        self.setup_audio();
-        self.sync_audio_volume();
-        self.reset_timing();
+        self.status_msg = format!("Loaded {} ROM: {}", console_name, rom_name);
+        self.finish_rom_load(path);
     }
 
     fn setup_audio(&mut self) {
@@ -635,51 +661,48 @@ impl EmuApp {
         });
     }
 
+    fn apply_key_map<K: Copy>(
+        input: &egui::InputState,
+        map: &[(egui::Key, K)],
+        mut apply: impl FnMut(K, bool),
+    ) {
+        for &(egui_key, emu_key) in map {
+            if input.key_pressed(egui_key) {
+                apply(emu_key, true);
+            }
+            if input.key_released(egui_key) {
+                apply(emu_key, false);
+            }
+        }
+    }
+
     fn handle_input(&mut self, ctx: &egui::Context) {
         ctx.input(|input| match &mut self.emu {
             Emulator::Gbc(emu) => {
-                let map: &[(egui::Key, GbcKey)] = &[
-                    (egui::Key::Z, GbcKey::A),
-                    (egui::Key::X, GbcKey::B),
-                    (egui::Key::Enter, GbcKey::Start),
-                    (egui::Key::Backspace, GbcKey::Select),
-                    (egui::Key::ArrowUp, GbcKey::Up),
-                    (egui::Key::ArrowDown, GbcKey::Down),
-                    (egui::Key::ArrowLeft, GbcKey::Left),
-                    (egui::Key::ArrowRight, GbcKey::Right),
-                ];
-
-                for &(ekey, gkey) in map {
-                    if input.key_pressed(ekey) {
-                        emu.bus.input.key_down(gkey);
-                    }
-                    if input.key_released(ekey) {
-                        emu.bus.input.key_up(gkey);
-                    }
-                }
+                Self::apply_key_map(
+                    input,
+                    &GBC_KEY_MAP,
+                    |key, pressed| {
+                        if pressed {
+                            emu.bus.input.key_down(key);
+                        } else {
+                            emu.bus.input.key_up(key);
+                        }
+                    },
+                );
             }
             Emulator::Gba(emu) => {
-                let map: &[(egui::Key, GbaKey)] = &[
-                    (egui::Key::Z, GbaKey::A),
-                    (egui::Key::X, GbaKey::B),
-                    (egui::Key::Enter, GbaKey::Start),
-                    (egui::Key::Backspace, GbaKey::Select),
-                    (egui::Key::ArrowUp, GbaKey::Up),
-                    (egui::Key::ArrowDown, GbaKey::Down),
-                    (egui::Key::ArrowLeft, GbaKey::Left),
-                    (egui::Key::ArrowRight, GbaKey::Right),
-                    (egui::Key::A, GbaKey::L),
-                    (egui::Key::S, GbaKey::R),
-                ];
-
-                for &(ekey, gkey) in map {
-                    if input.key_pressed(ekey) {
-                        emu.bus.input.key_down(gkey);
-                    }
-                    if input.key_released(ekey) {
-                        emu.bus.input.key_up(gkey);
-                    }
-                }
+                Self::apply_key_map(
+                    input,
+                    &GBA_KEY_MAP,
+                    |key, pressed| {
+                        if pressed {
+                            emu.bus.input.key_down(key);
+                        } else {
+                            emu.bus.input.key_up(key);
+                        }
+                    },
+                );
             }
             Emulator::None => {}
         });
