@@ -27,8 +27,8 @@ const BACKGROUND_SCREEN_MIN: egui::Vec2 = egui::vec2(551.0, 242.0);
 const BACKGROUND_SCREEN_SIZE: egui::Vec2 = egui::vec2(813.0, 542.0);
 const BUTTON_PRESS_IN_SPEED: f32 = 15.0;
 const BUTTON_PRESS_OUT_SPEED: f32 = 11.0;
-const BUTTON_OVERLAY_MAX_ALPHA: f32 = 144.0;
-const BUTTON_OVERLAY_TINT: u8 = 160;
+const BUTTON_OVERLAY_MAX_ALPHA: f32 = 50.0;
+const BUTTON_OVERLAY_TINT: u8 = 100;
 
 #[derive(Clone, Copy)]
 struct DisplaySettings {
@@ -148,8 +148,8 @@ impl OverlayButton {
             Self::Start => egui::vec2(316.0, 728.0),
             Self::Select => egui::vec2(315.0, 841.0),
             Self::Up => egui::vec2(125.0, 340.0),
-            Self::Down => egui::vec2(160.0, 530.0),
-            Self::Left => egui::vec2(73.0, 406.0),
+            Self::Down => egui::vec2(160.0, 545.0),
+            Self::Left => egui::vec2(62.0, 410.0),
             Self::Right => egui::vec2(253.0, 428.0),
         }
     }
