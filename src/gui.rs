@@ -128,6 +128,65 @@ impl Emulator {
             Self::None => Ok(None),
         }
     }
+
+    fn memory_regions(&self) -> &'static [DebugMemoryRegion] {
+        match self {
+            Self::Gbc(_) => &GBC_DEBUG_REGIONS,
+            Self::Gba(_) => &GBA_DEBUG_REGIONS,
+            Self::None => &[],
+        }
+    }
+
+    fn memory_view(&self, region: DebugMemoryRegion) -> Option<MemoryRegionView<'_>> {
+        match (self, region) {
+            (Self::Gbc(emu), DebugMemoryRegion::GbcWram) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0000_C000,
+                bytes: &emu.bus.wram,
+            }),
+            (Self::Gbc(emu), DebugMemoryRegion::GbcVram) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0000_8000,
+                bytes: &emu.bus.ppu.vram,
+            }),
+            (Self::Gbc(emu), DebugMemoryRegion::GbcHram) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0000_FF80,
+                bytes: &emu.bus.hram,
+            }),
+            (Self::Gbc(emu), DebugMemoryRegion::GbcOam) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0000_FE00,
+                bytes: &emu.bus.ppu.oam,
+            }),
+            (Self::Gba(emu), DebugMemoryRegion::GbaEwram) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0200_0000,
+                bytes: &emu.bus.ewram,
+            }),
+            (Self::Gba(emu), DebugMemoryRegion::GbaIwram) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0300_0000,
+                bytes: &emu.bus.iwram,
+            }),
+            (Self::Gba(emu), DebugMemoryRegion::GbaVram) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0600_0000,
+                bytes: &emu.bus.ppu.vram,
+            }),
+            (Self::Gba(emu), DebugMemoryRegion::GbaPalette) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0500_0000,
+                bytes: &emu.bus.ppu.palette,
+            }),
+            (Self::Gba(emu), DebugMemoryRegion::GbaOam) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0700_0000,
+                bytes: &emu.bus.ppu.oam,
+            }),
+            _ => None,
+        }
+    }
 }
 
 const FRAME_DURATION: Duration = Duration::from_nanos(16_742_706);
@@ -141,6 +200,7 @@ const BUTTON_PRESS_IN_SPEED: f32 = 15.0;
 const BUTTON_PRESS_OUT_SPEED: f32 = 11.0;
 const BUTTON_OVERLAY_MAX_ALPHA: f32 = 50.0;
 const BUTTON_OVERLAY_TINT: u8 = 100;
+const MEMORY_BYTES_PER_ROW: usize = 16;
 const GBC_KEY_MAP: [(egui::Key, GbcKey); 8] = [
     (egui::Key::Z, GbcKey::A),
     (egui::Key::X, GbcKey::B),
@@ -162,6 +222,56 @@ const GBA_KEY_MAP: [(egui::Key, GbaKey); 10] = [
     (egui::Key::ArrowRight, GbaKey::Right),
     (egui::Key::A, GbaKey::L),
     (egui::Key::S, GbaKey::R),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DebugMemoryRegion {
+    GbcWram,
+    GbcVram,
+    GbcHram,
+    GbcOam,
+    GbaEwram,
+    GbaIwram,
+    GbaVram,
+    GbaPalette,
+    GbaOam,
+}
+
+impl DebugMemoryRegion {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GbcWram => "GBC WRAM",
+            Self::GbcVram => "GBC VRAM",
+            Self::GbcHram => "GBC HRAM",
+            Self::GbcOam => "GBC OAM",
+            Self::GbaEwram => "GBA EWRAM",
+            Self::GbaIwram => "GBA IWRAM",
+            Self::GbaVram => "GBA VRAM",
+            Self::GbaPalette => "GBA Palette",
+            Self::GbaOam => "GBA OAM",
+        }
+    }
+}
+
+struct MemoryRegionView<'a> {
+    label: &'static str,
+    base_address: usize,
+    bytes: &'a [u8],
+}
+
+const GBC_DEBUG_REGIONS: [DebugMemoryRegion; 4] = [
+    DebugMemoryRegion::GbcWram,
+    DebugMemoryRegion::GbcVram,
+    DebugMemoryRegion::GbcHram,
+    DebugMemoryRegion::GbcOam,
+];
+
+const GBA_DEBUG_REGIONS: [DebugMemoryRegion; 5] = [
+    DebugMemoryRegion::GbaEwram,
+    DebugMemoryRegion::GbaIwram,
+    DebugMemoryRegion::GbaVram,
+    DebugMemoryRegion::GbaPalette,
+    DebugMemoryRegion::GbaOam,
 ];
 
 #[derive(Clone, Copy)]
@@ -210,6 +320,25 @@ impl DisplaySettings {
             (g * 255.0 + 0.5) as u8,
             (b * 255.0 + 0.5) as u8,
         )
+    }
+
+    fn slider(
+        ui: &mut egui::Ui,
+        value: &mut f32,
+        range: std::ops::RangeInclusive<f32>,
+        label: &str,
+    ) -> bool {
+        ui.add(egui::Slider::new(value, range).text(label)).changed()
+    }
+
+    fn draw_controls(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        changed |= Self::slider(ui, &mut self.gamma, 0.60..=2.40, "Gamma");
+        changed |= Self::slider(ui, &mut self.saturation, 0.0..=2.0, "Saturation");
+        changed |= Self::slider(ui, &mut self.red_gain, 0.5..=1.5, "Red");
+        changed |= Self::slider(ui, &mut self.green_gain, 0.5..=1.5, "Green");
+        changed |= Self::slider(ui, &mut self.blue_gain, 0.5..=1.5, "Blue");
+        changed
     }
 }
 
@@ -394,6 +523,9 @@ pub struct EmuApp {
     fps_sample_time: Duration,
     fps_sample_frames: u32,
     displayed_fps: f32,
+    show_registers_window: bool,
+    show_memory_window: bool,
+    selected_memory_region: Option<DebugMemoryRegion>,
     button_animation: [f32; OverlayButton::COUNT],
 }
 
@@ -443,6 +575,9 @@ impl EmuApp {
             fps_sample_time: Duration::ZERO,
             fps_sample_frames: 0,
             displayed_fps: 0.0,
+            show_registers_window: false,
+            show_memory_window: false,
+            selected_memory_region: None,
             button_animation: [0.0; OverlayButton::COUNT],
         }
     }
@@ -459,6 +594,235 @@ impl EmuApp {
             color_image,
             egui::TextureOptions::LINEAR,
         )
+    }
+
+    fn format_memory_line(base_address: usize, bytes: &[u8]) -> String {
+        let mut hex = String::new();
+        let mut ascii = String::new();
+
+        for &byte in bytes {
+            if !hex.is_empty() {
+                hex.push(' ');
+            }
+            hex.push_str(&format!("{:02X}", byte));
+            ascii.push(if byte.is_ascii_graphic() || byte == b' ' {
+                byte as char
+            } else {
+                '.'
+            });
+        }
+
+        format!("{:08X}  {:<47}  {}", base_address, hex, ascii)
+    }
+
+    fn draw_gbc_registers(ui: &mut egui::Ui, emu: &GbcEmulator) {
+        let cpu = &emu.cpu;
+        let af = ((cpu.a as u16) << 8) | ((cpu.f & 0xF0) as u16);
+        let bc = ((cpu.b as u16) << 8) | cpu.c as u16;
+        let de = ((cpu.d as u16) << 8) | cpu.e as u16;
+        let hl = ((cpu.h as u16) << 8) | cpu.l as u16;
+
+        egui::Grid::new("gbc_register_grid")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.monospace(format!("A  {:02X}", cpu.a));
+                ui.monospace(format!("F  {:02X}", cpu.f));
+                ui.end_row();
+                ui.monospace(format!("B  {:02X}", cpu.b));
+                ui.monospace(format!("C  {:02X}", cpu.c));
+                ui.end_row();
+                ui.monospace(format!("D  {:02X}", cpu.d));
+                ui.monospace(format!("E  {:02X}", cpu.e));
+                ui.end_row();
+                ui.monospace(format!("H  {:02X}", cpu.h));
+                ui.monospace(format!("L  {:02X}", cpu.l));
+                ui.end_row();
+                ui.monospace(format!("AF {:04X}", af));
+                ui.monospace(format!("BC {:04X}", bc));
+                ui.end_row();
+                ui.monospace(format!("DE {:04X}", de));
+                ui.monospace(format!("HL {:04X}", hl));
+                ui.end_row();
+                ui.monospace(format!("SP {:04X}", cpu.sp));
+                ui.monospace(format!("PC {:04X}", cpu.pc));
+                ui.end_row();
+            });
+
+        ui.separator();
+        ui.label(format!(
+            "Flags: Z={} N={} H={} C={} | IME={} Pending={} Halted={} Stopped={} | Cycles={}",
+            cpu.f & 0x80 != 0,
+            cpu.f & 0x40 != 0,
+            cpu.f & 0x20 != 0,
+            cpu.f & 0x10 != 0,
+            cpu.ime,
+            cpu.ime_pending,
+            cpu.halted,
+            cpu.stopped,
+            cpu.cycles
+        ));
+    }
+
+    fn draw_gba_registers(ui: &mut egui::Ui, emu: &GbaEmulator) {
+        let cpu = &emu.cpu;
+
+        egui::Grid::new("gba_register_grid")
+            .num_columns(4)
+            .spacing([16.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for row in 0..4 {
+                    for col in 0..4 {
+                        let index = row * 4 + col;
+                        ui.monospace(format!("R{:02} {:08X}", index, cpu.regs[index]));
+                    }
+                    ui.end_row();
+                }
+            });
+
+        ui.separator();
+        ui.label(format!(
+            "CPSR {:08X} | Mode={:?} | N={} Z={} C={} V={} I={} T={} | Halted={} | Cycles={}",
+            cpu.cpsr,
+            crate::cpu::arm7tdmi::CpuMode::from_bits(cpu.cpsr),
+            cpu.cpsr & (1 << 31) != 0,
+            cpu.cpsr & (1 << 30) != 0,
+            cpu.cpsr & (1 << 29) != 0,
+            cpu.cpsr & (1 << 28) != 0,
+            cpu.cpsr & (1 << 7) != 0,
+            cpu.cpsr & (1 << 5) != 0,
+            cpu.halted,
+            cpu.cycles,
+        ));
+    }
+
+    fn draw_registers_contents(&mut self, ui: &mut egui::Ui) {
+        match &self.emu {
+            Emulator::Gbc(emu) => Self::draw_gbc_registers(ui, emu),
+            Emulator::Gba(emu) => Self::draw_gba_registers(ui, emu),
+            Emulator::None => {
+                ui.label("Load a ROM to inspect register state.");
+            }
+        }
+    }
+
+    fn draw_memory_inspector_contents(&mut self, ui: &mut egui::Ui) {
+        let regions = self.emu.memory_regions();
+        if regions.is_empty() {
+            ui.label("Load a ROM to inspect RAM or VRAM.");
+            return;
+        }
+
+        let active_region = self
+            .selected_memory_region
+            .filter(|region| regions.contains(region))
+            .unwrap_or(regions[0]);
+        self.selected_memory_region = Some(active_region);
+
+        egui::ComboBox::from_label("Region")
+            .selected_text(active_region.label())
+            .show_ui(ui, |ui| {
+                for &region in regions {
+                    ui.selectable_value(&mut self.selected_memory_region, Some(region), region.label());
+                }
+            });
+
+        let active_region = self.selected_memory_region.unwrap_or(regions[0]);
+        let Some(view) = self.emu.memory_view(active_region) else {
+            ui.label("Selected region is unavailable for the current console.");
+            return;
+        };
+
+        ui.label(format!(
+            "{} | Base 0x{:08X} | {} bytes",
+            view.label,
+            view.base_address,
+            view.bytes.len()
+        ));
+        ui.separator();
+
+        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+        let row_count = (view.bytes.len() + MEMORY_BYTES_PER_ROW - 1) / MEMORY_BYTES_PER_ROW;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, row_count, |ui, row_range| {
+                for row in row_range {
+                    let start = row * MEMORY_BYTES_PER_ROW;
+                    let end = (start + MEMORY_BYTES_PER_ROW).min(view.bytes.len());
+                    ui.monospace(Self::format_memory_line(
+                        view.base_address + start,
+                        &view.bytes[start..end],
+                    ));
+                }
+            });
+    }
+
+    fn draw_registers_window(&mut self, ctx: &egui::Context) {
+        if !self.show_registers_window {
+            return;
+        }
+
+        let viewport_id = egui::ViewportId::from_hash_of("gbrust-registers-window");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Registers")
+            .with_inner_size([420.0, 320.0])
+            .with_min_inner_size([360.0, 240.0]);
+
+        ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| {
+            if ctx.input(|input| input.viewport().close_requested()) {
+                self.show_registers_window = false;
+            }
+
+            if matches!(class, egui::ViewportClass::Embedded) {
+                let mut open = self.show_registers_window;
+                egui::Window::new("Registers")
+                    .open(&mut open)
+                    .resizable(true)
+                    .vscroll(true)
+                    .default_width(420.0)
+                    .show(ctx, |ui| self.draw_registers_contents(ui));
+                self.show_registers_window = open;
+            } else {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    self.draw_registers_contents(ui);
+                });
+            }
+        });
+    }
+
+    fn draw_memory_inspector_window(&mut self, ctx: &egui::Context) {
+        if !self.show_memory_window {
+            return;
+        }
+
+        let viewport_id = egui::ViewportId::from_hash_of("gbrust-memory-window");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Memory Inspector")
+            .with_inner_size([640.0, 420.0])
+            .with_min_inner_size([520.0, 320.0]);
+
+        ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| {
+            if ctx.input(|input| input.viewport().close_requested()) {
+                self.show_memory_window = false;
+            }
+
+            if matches!(class, egui::ViewportClass::Embedded) {
+                let mut open = self.show_memory_window;
+                egui::Window::new("Memory Inspector")
+                    .open(&mut open)
+                    .resizable(true)
+                    .default_size([640.0, 420.0])
+                    .show(ctx, |ui| self.draw_memory_inspector_contents(ui));
+                self.show_memory_window = open;
+            } else {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    self.draw_memory_inspector_contents(ui);
+                });
+            }
+        });
     }
 
     fn fit_background(available: egui::Vec2) -> egui::Vec2 {
@@ -955,39 +1319,7 @@ impl EmuApp {
 
                 ui.group(|ui| {
                     ui.label(RichText::new("Display").strong());
-                    display_changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.display_settings.gamma, 0.60..=2.40)
-                                .text("Gamma"),
-                        )
-                        .changed();
-                    display_changed |= ui
-                        .add(
-                            egui::Slider::new(
-                                &mut self.display_settings.saturation,
-                                0.0..=2.0,
-                            )
-                            .text("Saturation"),
-                        )
-                        .changed();
-                    display_changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.display_settings.red_gain, 0.5..=1.5)
-                                .text("Red"),
-                        )
-                        .changed();
-                    display_changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.display_settings.green_gain, 0.5..=1.5)
-                                .text("Green"),
-                        )
-                        .changed();
-                    display_changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.display_settings.blue_gain, 0.5..=1.5)
-                                .text("Blue"),
-                        )
-                        .changed();
+                    display_changed |= self.display_settings.draw_controls(ui);
 
                     if ui.button("Reset Display").clicked() {
                         self.display_settings = DisplaySettings::default();
@@ -998,6 +1330,12 @@ impl EmuApp {
                 ui.group(|ui| {
                     ui.label(RichText::new("Keyboard").strong());
                     ui.label(self.key_legend());
+                });
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("Debug").strong());
+                    ui.checkbox(&mut self.show_registers_window, "Registers");
+                    ui.checkbox(&mut self.show_memory_window, "Memory inspector");
                 });
             });
 
@@ -1142,6 +1480,8 @@ impl eframe::App for EmuApp {
         self.update_fps(elapsed, frames_run);
 
         self.draw_screen(ctx, &mut open_rom);
+        self.draw_registers_window(ctx);
+        self.draw_memory_inspector_window(ctx);
 
         if open_rom {
             self.open_rom_dialog();
