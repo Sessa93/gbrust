@@ -389,16 +389,16 @@ impl OverlayButton {
 
     fn image_bytes(self) -> &'static [u8] {
         match self {
-            Self::A => include_bytes!("../resources/a.png"),
-            Self::B => include_bytes!("../resources/b.png"),
-            Self::L => include_bytes!("../resources/l.png"),
-            Self::R => include_bytes!("../resources/r.png"),
-            Self::Start => include_bytes!("../resources/start.png"),
-            Self::Select => include_bytes!("../resources/select.png"),
-            Self::Up => include_bytes!("../resources/up.png"),
-            Self::Down => include_bytes!("../resources/down.png"),
-            Self::Left => include_bytes!("../resources/left.png"),
-            Self::Right => include_bytes!("../resources/right.png"),
+            Self::A => include_bytes!("../resources/gba/a.png"),
+            Self::B => include_bytes!("../resources/gba/b.png"),
+            Self::L => include_bytes!("../resources/gba/l.png"),
+            Self::R => include_bytes!("../resources/gba/r.png"),
+            Self::Start => include_bytes!("../resources/gba/start.png"),
+            Self::Select => include_bytes!("../resources/gba/select.png"),
+            Self::Up => include_bytes!("../resources/gba/up.png"),
+            Self::Down => include_bytes!("../resources/gba/down.png"),
+            Self::Left => include_bytes!("../resources/gba/left.png"),
+            Self::Right => include_bytes!("../resources/gba/right.png"),
         }
     }
 
@@ -583,7 +583,7 @@ impl EmuApp {
     }
 
     fn load_background_texture(ctx: &egui::Context) -> egui::TextureHandle {
-        let image = image::load_from_memory(include_bytes!("../resources/background.png"))
+        let image = image::load_from_memory(include_bytes!("../resources/gba/background.png"))
             .expect("background.png should be a valid PNG")
             .to_rgba8();
         let size = [image.width() as usize, image.height() as usize];
