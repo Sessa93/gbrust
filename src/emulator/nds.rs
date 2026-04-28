@@ -17,6 +17,18 @@ const MAIN_BG_PALETTE_OFFSET: usize = 0x000;
 const SUB_BG_PALETTE_OFFSET: usize = 0x400;
 const BG_ENABLE_BITS: [u32; 4] = [1 << 8, 1 << 9, 1 << 10, 1 << 11];
 
+#[derive(Clone, Copy)]
+enum NdsBgKind {
+    Text,
+    Affine,
+}
+
+#[derive(Clone, Copy)]
+struct NdsBgLayer {
+    bg: usize,
+    kind: NdsBgKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NdsRomHeader {
     pub game_title: String,
@@ -186,9 +198,15 @@ impl NdsEmulator {
             self.bus.ppu_main.bgcnt,
             self.bus.ppu_main.bghofs,
             self.bus.ppu_main.bgvofs,
+            self.bus.ppu_main.bg_pa,
+            self.bus.ppu_main.bg_pb,
+            self.bus.ppu_main.bg_pc,
+            self.bus.ppu_main.bg_pd,
+            self.bus.ppu_main.bg_ref_x,
+            self.bus.ppu_main.bg_ref_y,
             self.bus.ppu_main.master_bright,
         );
-        if !self.render_text_bg_layers(
+        if !self.render_bg_layers(
             0,
             MAIN_SCREEN_VRAM_OFFSET,
             MAIN_BG_PALETTE_OFFSET,
@@ -197,8 +215,14 @@ impl NdsEmulator {
             main_state.2,
             main_state.3,
             main_state.4,
+            main_state.5,
+            main_state.6,
+            main_state.7,
+            main_state.8,
+            main_state.9,
+            main_state.10,
         ) {
-            self.render_screen_preview(0, MAIN_SCREEN_VRAM_OFFSET, main_state.0, main_state.4);
+            self.render_screen_preview(0, MAIN_SCREEN_VRAM_OFFSET, main_state.0, main_state.10);
         }
 
         let sub_state = (
@@ -206,9 +230,15 @@ impl NdsEmulator {
             self.bus.ppu_sub.bgcnt,
             self.bus.ppu_sub.bghofs,
             self.bus.ppu_sub.bgvofs,
+            self.bus.ppu_sub.bg_pa,
+            self.bus.ppu_sub.bg_pb,
+            self.bus.ppu_sub.bg_pc,
+            self.bus.ppu_sub.bg_pd,
+            self.bus.ppu_sub.bg_ref_x,
+            self.bus.ppu_sub.bg_ref_y,
             self.bus.ppu_sub.master_bright,
         );
-        if !self.render_text_bg_layers(
+        if !self.render_bg_layers(
             NDS_SCREEN_HEIGHT,
             SUB_SCREEN_VRAM_OFFSET,
             SUB_BG_PALETTE_OFFSET,
@@ -217,8 +247,14 @@ impl NdsEmulator {
             sub_state.2,
             sub_state.3,
             sub_state.4,
+            sub_state.5,
+            sub_state.6,
+            sub_state.7,
+            sub_state.8,
+            sub_state.9,
+            sub_state.10,
         ) {
-            self.render_screen_preview(NDS_SCREEN_HEIGHT, SUB_SCREEN_VRAM_OFFSET, sub_state.0, sub_state.4);
+            self.render_screen_preview(NDS_SCREEN_HEIGHT, SUB_SCREEN_VRAM_OFFSET, sub_state.0, sub_state.10);
         }
     }
 
@@ -280,7 +316,7 @@ impl NdsEmulator {
         }
     }
 
-    fn render_text_bg_layers(
+    fn render_bg_layers(
         &mut self,
         screen_y: usize,
         vram_offset: usize,
@@ -289,10 +325,16 @@ impl NdsEmulator {
         bgcnt: [u16; 4],
         bghofs: [u16; 4],
         bgvofs: [u16; 4],
+        bg_pa: [i16; 2],
+        bg_pb: [i16; 2],
+        bg_pc: [i16; 2],
+        bg_pd: [i16; 2],
+        bg_ref_x: [i32; 2],
+        bg_ref_y: [i32; 2],
         master_bright: u16,
     ) -> bool {
-        let enabled_bgs = active_text_bgs(dispcnt, bgcnt);
-        if enabled_bgs.is_empty() {
+        let active_layers = active_2d_bgs(dispcnt, bgcnt);
+        if active_layers.is_empty() {
             return false;
         }
 
@@ -313,18 +355,40 @@ impl NdsEmulator {
             let row_start = (screen_y + screen_line) * NDS_WIDTH;
 
             for px in 0..NDS_WIDTH {
-                for &bg in &enabled_bgs {
-                    if let Some(raw_color) = sample_text_bg_pixel(
-                        vram,
-                        palette,
-                        vram_offset,
-                        palette_offset,
-                        bgcnt[bg],
-                        bghofs[bg],
-                        bgvofs[bg],
-                        px,
-                        screen_line,
-                    ) {
+                for layer in &active_layers {
+                    let raw_color = match layer.kind {
+                        NdsBgKind::Text => sample_text_bg_pixel(
+                            vram,
+                            palette,
+                            vram_offset,
+                            palette_offset,
+                            bgcnt[layer.bg],
+                            bghofs[layer.bg],
+                            bgvofs[layer.bg],
+                            px,
+                            screen_line,
+                        ),
+                        NdsBgKind::Affine => {
+                            let affine_index = layer.bg - 2;
+                            sample_affine_bg_pixel(
+                                vram,
+                                palette,
+                                vram_offset,
+                                palette_offset,
+                                bgcnt[layer.bg],
+                                bg_pa[affine_index],
+                                bg_pb[affine_index],
+                                bg_pc[affine_index],
+                                bg_pd[affine_index],
+                                bg_ref_x[affine_index],
+                                bg_ref_y[affine_index],
+                                px,
+                                screen_line,
+                            )
+                        }
+                    };
+
+                    if let Some(raw_color) = raw_color {
                         framebuffer[row_start + px] = rgb555_to_argb(apply_master_brightness(raw_color, master_bright));
                         break;
                     }
@@ -453,20 +517,39 @@ fn read_color_16(region: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([region[offset], region[offset + 1]])
 }
 
-fn active_text_bgs(dispcnt: u32, bgcnt: [u16; 4]) -> Vec<usize> {
+fn active_2d_bgs(dispcnt: u32, bgcnt: [u16; 4]) -> Vec<NdsBgLayer> {
     let mut active = Vec::new();
+    let bg_mode = (dispcnt & 0x7) as u8;
     for bg in 0..4usize {
         let enabled = dispcnt & BG_ENABLE_BITS[bg] != 0;
-        let supported = match bg {
-            0 | 1 => true,
-            _ => (dispcnt & 0x7) == 0,
+        let kind = match bg {
+            0 | 1 => Some(NdsBgKind::Text),
+            2 => {
+                if bg_mode == 0 {
+                    Some(NdsBgKind::Text)
+                } else {
+                    Some(NdsBgKind::Affine)
+                }
+            }
+            3 => {
+                if bg_mode == 0 {
+                    Some(NdsBgKind::Text)
+                } else if bg_mode >= 2 {
+                    Some(NdsBgKind::Affine)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         };
-        if enabled && supported {
-            active.push(bg);
+        if enabled {
+            if let Some(kind) = kind {
+                active.push(NdsBgLayer { bg, kind });
+            }
         }
     }
 
-    active.sort_by_key(|&bg| ((bgcnt[bg] & 0x3) as usize, bg));
+    active.sort_by_key(|layer| ((bgcnt[layer.bg] & 0x3) as usize, layer.bg));
     active
 }
 
@@ -552,6 +635,73 @@ fn sample_text_bg_pixel(
         }
         Some(read_color_16(palette, palette_entry))
     }
+}
+
+fn sample_affine_bg_pixel(
+    vram: &[u8],
+    palette: &[u8],
+    vram_offset: usize,
+    palette_offset: usize,
+    bgcnt: u16,
+    bg_pa: i16,
+    bg_pb: i16,
+    bg_pc: i16,
+    bg_pd: i16,
+    bg_ref_x: i32,
+    bg_ref_y: i32,
+    px: usize,
+    screen_line: usize,
+) -> Option<u16> {
+    let char_base = vram_offset + (((bgcnt as usize >> 2) & 0xF) * 0x4000);
+    let screen_base = vram_offset + (((bgcnt as usize >> 8) & 0x1F) * 0x800);
+    let wrap = bgcnt & 0x2000 != 0;
+    let screen_size = match (bgcnt >> 14) & 0x3 {
+        0 => 128i32,
+        1 => 256i32,
+        2 => 512i32,
+        3 => 1024i32,
+        _ => 128i32,
+    };
+    let map_size = (screen_size as usize) / 8;
+    let tex_x = (bg_ref_x + bg_pa as i32 * px as i32 + bg_pb as i32 * screen_line as i32) >> 8;
+    let tex_y = (bg_ref_y + bg_pc as i32 * px as i32 + bg_pd as i32 * screen_line as i32) >> 8;
+
+    let (tx, ty) = if wrap {
+        (tex_x.rem_euclid(screen_size), tex_y.rem_euclid(screen_size))
+    } else {
+        if tex_x < 0 || tex_x >= screen_size || tex_y < 0 || tex_y >= screen_size {
+            return None;
+        }
+        (tex_x, tex_y)
+    };
+
+    let tile_x = (tx / 8) as usize;
+    let tile_y = (ty / 8) as usize;
+    let fine_x = (tx % 8) as usize;
+    let fine_y = (ty % 8) as usize;
+
+    let map_offset = screen_base + tile_y * map_size + tile_x;
+    if map_offset >= vram.len() {
+        return None;
+    }
+
+    let tile_num = vram[map_offset] as usize;
+    let pixel_offset = char_base + tile_num * 64 + fine_y * 8 + fine_x;
+    if pixel_offset >= vram.len() {
+        return None;
+    }
+
+    let palette_index = vram[pixel_offset] as usize;
+    if palette_index == 0 {
+        return None;
+    }
+
+    let palette_entry = palette_offset + palette_index * 2;
+    if palette_entry + 1 >= palette.len() {
+        return None;
+    }
+
+    Some(read_color_16(palette, palette_entry))
 }
 
 #[cfg(test)]
@@ -719,5 +869,24 @@ mod tests {
         emu.run_frame();
 
         assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x001F));
+    }
+
+    #[test]
+    fn nds_emulator_renders_affine_bg2_layers() {
+        let rom = build_test_rom();
+        let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
+
+        emu.bus.ppu_main.dispcnt = 1 | BG_ENABLE_BITS[2];
+        emu.bus.ppu_main.bgcnt[2] = 1 << 8;
+        emu.bus.ppu_main.bg_pa[0] = 0x0100;
+        emu.bus.ppu_main.bg_pd[0] = 0x0100;
+        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET] = 1;
+        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET + 0x800] = 0;
+        emu.bus.memory.palette[MAIN_BG_PALETTE_OFFSET + 2..MAIN_BG_PALETTE_OFFSET + 4]
+            .copy_from_slice(&0x7C00u16.to_le_bytes());
+
+        emu.run_frame();
+
+        assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x7C00));
     }
 }
