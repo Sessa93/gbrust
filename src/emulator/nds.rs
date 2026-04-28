@@ -193,6 +193,8 @@ impl NdsEmulator {
 
     fn refresh_framebuffer(&mut self) {
         self.refresh_placeholder_framebuffer();
+        let main_bg_vram = self.bus.mapped_main_bg_vram();
+        let sub_bg_vram = self.bus.mapped_sub_bg_vram();
         let main_state = (
             self.bus.ppu_main.dispcnt,
             self.bus.ppu_main.bgcnt,
@@ -208,7 +210,7 @@ impl NdsEmulator {
         );
         if !self.render_bg_layers(
             0,
-            MAIN_SCREEN_VRAM_OFFSET,
+            &main_bg_vram,
             MAIN_BG_PALETTE_OFFSET,
             main_state.0,
             main_state.1,
@@ -240,7 +242,7 @@ impl NdsEmulator {
         );
         if !self.render_bg_layers(
             NDS_SCREEN_HEIGHT,
-            SUB_SCREEN_VRAM_OFFSET,
+            &sub_bg_vram,
             SUB_BG_PALETTE_OFFSET,
             sub_state.0,
             sub_state.1,
@@ -319,7 +321,7 @@ impl NdsEmulator {
     fn render_bg_layers(
         &mut self,
         screen_y: usize,
-        vram_offset: usize,
+        vram: &[u8],
         palette_offset: usize,
         dispcnt: u32,
         bgcnt: [u16; 4],
@@ -342,9 +344,8 @@ impl NdsEmulator {
             return false;
         }
 
-        let vram = &self.bus.memory.vram;
         let palette = &self.bus.memory.palette;
-        if vram_offset >= vram.len() || palette_offset + 1 >= palette.len() {
+        if vram.is_empty() || palette_offset + 1 >= palette.len() {
             return false;
         }
 
@@ -364,7 +365,6 @@ impl NdsEmulator {
                         NdsBgKind::Text => sample_text_bg_pixel(
                             vram,
                             palette,
-                            vram_offset,
                             palette_offset,
                             bgcnt[layer.bg],
                             bghofs[layer.bg],
@@ -377,7 +377,6 @@ impl NdsEmulator {
                             sample_affine_bg_pixel(
                                 vram,
                                 palette,
-                                vram_offset,
                                 palette_offset,
                                 bgcnt[layer.bg],
                                 bg_pa[affine_index],
@@ -604,7 +603,6 @@ fn active_2d_bgs(dispcnt: u32, bgcnt: [u16; 4]) -> Vec<NdsBgLayer> {
 fn sample_text_bg_pixel(
     vram: &[u8],
     palette: &[u8],
-    vram_offset: usize,
     palette_offset: usize,
     bgcnt: u16,
     bghofs: u16,
@@ -612,8 +610,8 @@ fn sample_text_bg_pixel(
     px: usize,
     screen_line: usize,
 ) -> Option<u16> {
-    let char_base = vram_offset + (((bgcnt as usize >> 2) & 0xF) * 0x4000);
-    let screen_base = vram_offset + (((bgcnt as usize >> 8) & 0x1F) * 0x800);
+    let char_base = ((bgcnt as usize >> 2) & 0xF) * 0x4000;
+    let screen_base = ((bgcnt as usize >> 8) & 0x1F) * 0x800;
     let color_256 = bgcnt & 0x0080 != 0;
     let (map_w, map_h) = match (bgcnt >> 14) & 0x3 {
         0 => (32usize, 32usize),
@@ -688,7 +686,6 @@ fn sample_text_bg_pixel(
 fn sample_affine_bg_pixel(
     vram: &[u8],
     palette: &[u8],
-    vram_offset: usize,
     palette_offset: usize,
     bgcnt: u16,
     bg_pa: i16,
@@ -700,8 +697,8 @@ fn sample_affine_bg_pixel(
     px: usize,
     screen_line: usize,
 ) -> Option<u16> {
-    let char_base = vram_offset + (((bgcnt as usize >> 2) & 0xF) * 0x4000);
-    let screen_base = vram_offset + (((bgcnt as usize >> 8) & 0x1F) * 0x800);
+    let char_base = ((bgcnt as usize >> 2) & 0xF) * 0x4000;
+    let screen_base = ((bgcnt as usize >> 8) & 0x1F) * 0x800;
     let wrap = bgcnt & 0x2000 != 0;
     let screen_size = match (bgcnt >> 14) & 0x3 {
         0 => 128i32,
@@ -760,6 +757,10 @@ mod tests {
         MAIN_BG_PALETTE_OFFSET, MAIN_SCREEN_VRAM_OFFSET, NDS_SCREEN_HEIGHT, NDS_WIDTH,
         SUB_BG_PALETTE_OFFSET, SUB_SCREEN_VRAM_OFFSET,
     };
+    use crate::cpu::arm7tdmi::Arm7Bus;
+
+    const REG_VRAMCNT_A: u32 = 0x0400_0240;
+    const REG_VRAMCNT_C: u32 = 0x0400_0242;
 
     fn build_test_rom() -> Vec<u8> {
         let mut rom = vec![0u8; 0x400];
@@ -877,15 +878,18 @@ mod tests {
         emu.bus.ppu_sub.dispcnt = BG_ENABLE_BITS[0];
         emu.bus.ppu_sub.bgcnt[0] = 0x0080 | (1 << 8);
 
-        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET] = 1;
-        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET + 0x800..MAIN_SCREEN_VRAM_OFFSET + 0x802]
-            .copy_from_slice(&0u16.to_le_bytes());
+        {
+            let mut arm9_bus = emu.bus.arm9_view();
+            arm9_bus.write8(REG_VRAMCNT_A, 0x80 | 0x01);
+            arm9_bus.write8(REG_VRAMCNT_C, 0x80 | 0x04);
+            arm9_bus.write8(0x0600_0000, 1);
+            arm9_bus.write16(0x0600_0800, 0);
+            arm9_bus.write8(0x0620_0000, 1);
+            arm9_bus.write16(0x0620_0800, 0);
+        }
+
         emu.bus.memory.palette[MAIN_BG_PALETTE_OFFSET + 2..MAIN_BG_PALETTE_OFFSET + 4]
             .copy_from_slice(&0x03E0u16.to_le_bytes());
-
-        emu.bus.memory.vram[SUB_SCREEN_VRAM_OFFSET] = 1;
-        emu.bus.memory.vram[SUB_SCREEN_VRAM_OFFSET + 0x800..SUB_SCREEN_VRAM_OFFSET + 0x802]
-            .copy_from_slice(&0u16.to_le_bytes());
         emu.bus.memory.palette[SUB_BG_PALETTE_OFFSET + 2..SUB_BG_PALETTE_OFFSET + 4]
             .copy_from_slice(&0x7C00u16.to_le_bytes());
 
@@ -904,12 +908,15 @@ mod tests {
         emu.bus.ppu_main.bgcnt[0] = 0x0080 | (1 << 8) | 1;
         emu.bus.ppu_main.bgcnt[1] = 0x0080 | (2 << 8) | (1 << 2);
 
-        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET] = 1;
-        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET + 0x800..MAIN_SCREEN_VRAM_OFFSET + 0x802]
-            .copy_from_slice(&0u16.to_le_bytes());
-        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET + 0x4000] = 2;
-        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET + 0x1000..MAIN_SCREEN_VRAM_OFFSET + 0x1002]
-            .copy_from_slice(&0u16.to_le_bytes());
+        {
+            let mut arm9_bus = emu.bus.arm9_view();
+            arm9_bus.write8(REG_VRAMCNT_A, 0x80 | 0x01);
+            arm9_bus.write8(0x0600_0000, 1);
+            arm9_bus.write16(0x0600_0800, 0);
+            arm9_bus.write8(0x0600_4000, 2);
+            arm9_bus.write16(0x0600_1000, 0);
+        }
+
         emu.bus.memory.palette[MAIN_BG_PALETTE_OFFSET + 2..MAIN_BG_PALETTE_OFFSET + 4]
             .copy_from_slice(&0x03E0u16.to_le_bytes());
         emu.bus.memory.palette[MAIN_BG_PALETTE_OFFSET + 4..MAIN_BG_PALETTE_OFFSET + 6]
@@ -929,8 +936,12 @@ mod tests {
         emu.bus.ppu_main.bgcnt[2] = 1 << 8;
         emu.bus.ppu_main.bg_pa[0] = 0x0100;
         emu.bus.ppu_main.bg_pd[0] = 0x0100;
-        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET] = 1;
-        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET + 0x800] = 0;
+        {
+            let mut arm9_bus = emu.bus.arm9_view();
+            arm9_bus.write8(REG_VRAMCNT_A, 0x80 | 0x01);
+            arm9_bus.write8(0x0600_0000, 1);
+            arm9_bus.write8(0x0600_0800, 0);
+        }
         emu.bus.memory.palette[MAIN_BG_PALETTE_OFFSET + 2..MAIN_BG_PALETTE_OFFSET + 4]
             .copy_from_slice(&0x7C00u16.to_le_bytes());
 
