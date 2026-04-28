@@ -5,7 +5,9 @@ use crate::emulator::nds::NdsRomHeader;
 use crate::input::{NdsInput, NdsKey};
 
 const ARM7_BIOS_SIZE: usize = 0x4000;
+const ARM9_BIOS_SIZE: usize = 0x8000;
 const IO_SIZE: usize = 0x1000;
+const ARM9_BIOS_BASE: u32 = 0xFFFF_0000;
 const MAIN_RAM_BASE: u32 = 0x0200_0000;
 const MAIN_RAM_SIZE: usize = 4 * 1024 * 1024;
 const SHARED_WRAM_BASE: u32 = 0x0300_0000;
@@ -130,6 +132,7 @@ pub struct NdsBus {
     pub memory: NdsMemory,
     pub io: Vec<u8>,
     pub bios7: Vec<u8>,
+    pub bios9: Vec<u8>,
     pub cartridge_rom: Vec<u8>,
     pub ie: u32,
     pub iflag: u32,
@@ -138,6 +141,13 @@ pub struct NdsBus {
     pub postflg: u8,
     pub last_bios_value: u32,
     pub cycles: u64,
+    pub arm9_ie: u32,
+    pub arm9_iflag: u32,
+    pub arm9_ime: bool,
+    pub arm9_halt: bool,
+    pub arm9_postflg: u8,
+    pub arm9_last_bios_value: u32,
+    pub arm9_cycles: u64,
 }
 
 impl NdsBus {
@@ -150,6 +160,7 @@ impl NdsBus {
             memory,
             io: vec![0; IO_SIZE],
             bios7: Self::generate_hle_bios7(),
+            bios9: Self::generate_hle_bios9(),
             cartridge_rom: rom,
             ie: 0,
             iflag: 0,
@@ -158,11 +169,25 @@ impl NdsBus {
             postflg: 1,
             last_bios_value: 0,
             cycles: 0,
+            arm9_ie: 0,
+            arm9_iflag: 0,
+            arm9_ime: false,
+            arm9_halt: false,
+            arm9_postflg: 1,
+            arm9_last_bios_value: 0,
+            arm9_cycles: 0,
         })
     }
 
     fn generate_hle_bios7() -> Vec<u8> {
         let mut bios = vec![0u8; ARM7_BIOS_SIZE];
+        let movs_pc_lr: u32 = 0xE1B0_F00E;
+        bios[0x08..0x0C].copy_from_slice(&movs_pc_lr.to_le_bytes());
+        bios
+    }
+
+    fn generate_hle_bios9() -> Vec<u8> {
+        let mut bios = vec![0u8; ARM9_BIOS_SIZE];
         let movs_pc_lr: u32 = 0xE1B0_F00E;
         bios[0x08..0x0C].copy_from_slice(&movs_pc_lr.to_le_bytes());
         bios
@@ -175,8 +200,23 @@ impl NdsBus {
         }
     }
 
+    pub fn tick_arm9(&mut self, cycles: u32) {
+        self.arm9_cycles += cycles as u64;
+        if self.arm9_halt && self.arm9_check_irq() {
+            self.arm9_halt = false;
+        }
+    }
+
     pub fn check_irq(&self) -> bool {
         self.ime && (self.ie & self.iflag) != 0
+    }
+
+    pub fn arm9_check_irq(&self) -> bool {
+        self.arm9_ime && (self.arm9_ie & self.arm9_iflag) != 0
+    }
+
+    pub fn arm9_view(&mut self) -> NdsArm9Bus<'_> {
+        NdsArm9Bus { bus: self }
     }
 
     pub fn set_key(&mut self, key: NdsKey, pressed: bool) {
@@ -212,6 +252,27 @@ impl NdsBus {
         }
     }
 
+    fn read_arm9_io_byte(&self, addr: u32) -> u8 {
+        match addr {
+            REG_IME => self.arm9_ime as u8,
+            REG_IME_HI_1 | REG_IME_HI_2 | REG_IME_HI_3 => 0,
+            REG_IE => self.arm9_ie as u8,
+            REG_IE_HI_1 => (self.arm9_ie >> 8) as u8,
+            REG_IE_HI_2 => (self.arm9_ie >> 16) as u8,
+            REG_IE_HI_3 => (self.arm9_ie >> 24) as u8,
+            REG_IF => self.arm9_iflag as u8,
+            REG_IF_HI_1 => (self.arm9_iflag >> 8) as u8,
+            REG_IF_HI_2 => (self.arm9_iflag >> 16) as u8,
+            REG_IF_HI_3 => (self.arm9_iflag >> 24) as u8,
+            REG_POSTFLG => self.arm9_postflg,
+            REG_HALTCNT => (self.arm9_halt as u8) << 7,
+            _ if (IO_BASE..IO_BASE + IO_SIZE as u32).contains(&addr) => {
+                self.io[(addr - IO_BASE) as usize]
+            }
+            _ => 0,
+        }
+    }
+
     fn write_io_byte(&mut self, addr: u32, value: u8) {
         match addr {
             REG_IME => self.ime = value & 0x01 != 0,
@@ -232,12 +293,104 @@ impl NdsBus {
         }
     }
 
+    fn write_arm9_io_byte(&mut self, addr: u32, value: u8) {
+        match addr {
+            REG_IME => self.arm9_ime = value & 0x01 != 0,
+            REG_IE => self.arm9_ie = (self.arm9_ie & !0x0000_00FF) | value as u32,
+            REG_IE_HI_1 => self.arm9_ie = (self.arm9_ie & !0x0000_FF00) | ((value as u32) << 8),
+            REG_IE_HI_2 => self.arm9_ie = (self.arm9_ie & !0x00FF_0000) | ((value as u32) << 16),
+            REG_IE_HI_3 => self.arm9_ie = (self.arm9_ie & !0xFF00_0000) | ((value as u32) << 24),
+            REG_IF => self.arm9_iflag &= !(value as u32),
+            REG_IF_HI_1 => self.arm9_iflag &= !((value as u32) << 8),
+            REG_IF_HI_2 => self.arm9_iflag &= !((value as u32) << 16),
+            REG_IF_HI_3 => self.arm9_iflag &= !((value as u32) << 24),
+            REG_POSTFLG => self.arm9_postflg = value,
+            REG_HALTCNT => self.arm9_halt = value & 0x80 != 0,
+            _ if (IO_BASE..IO_BASE + IO_SIZE as u32).contains(&addr) => {
+                self.io[(addr - IO_BASE) as usize] = value;
+            }
+            _ => {}
+        }
+    }
+
     fn read_region(region: &[u8], base: u32, addr: u32) -> u8 {
         region[(addr - base) as usize]
     }
 
     fn write_region(region: &mut [u8], base: u32, addr: u32, value: u8) {
         region[(addr - base) as usize] = value;
+    }
+}
+
+pub struct NdsArm9Bus<'a> {
+    bus: &'a mut NdsBus,
+}
+
+impl Arm7Bus for NdsArm9Bus<'_> {
+    fn read8(&self, addr: u32) -> u8 {
+        match addr {
+            MAIN_RAM_BASE..=0x023F_FFFF => NdsBus::read_region(&self.bus.memory.main_ram, MAIN_RAM_BASE, addr),
+            SHARED_WRAM_BASE..=0x0300_7FFF => {
+                NdsBus::read_region(&self.bus.memory.shared_wram, SHARED_WRAM_BASE, addr)
+            }
+            IO_BASE..=0x0400_0FFF => self.bus.read_arm9_io_byte(addr),
+            PALETTE_BASE..=0x0500_0FFF => NdsBus::read_region(&self.bus.memory.palette, PALETTE_BASE, addr),
+            VRAM_BASE..=0x060A_3FFF => NdsBus::read_region(&self.bus.memory.vram, VRAM_BASE, addr),
+            OAM_BASE..=0x0700_03FF => NdsBus::read_region(&self.bus.memory.oam, OAM_BASE, addr),
+            CART_BASE..=0x09FF_FFFF => {
+                let offset = (addr - CART_BASE) as usize;
+                self.bus.cartridge_rom.get(offset).copied().unwrap_or(0xFF)
+            }
+            ARM9_BIOS_BASE..=0xFFFF_7FFF => NdsBus::read_region(&self.bus.bios9, ARM9_BIOS_BASE, addr),
+            _ => 0,
+        }
+    }
+
+    fn read16(&mut self, addr: u32) -> u16 {
+        u16::from_le_bytes([self.read8(addr), self.read8(addr.wrapping_add(1))])
+    }
+
+    fn read32(&mut self, addr: u32) -> u32 {
+        let value = u32::from_le_bytes([
+            self.read8(addr),
+            self.read8(addr.wrapping_add(1)),
+            self.read8(addr.wrapping_add(2)),
+            self.read8(addr.wrapping_add(3)),
+        ]);
+        self.bus.arm9_last_bios_value = value;
+        value
+    }
+
+    fn write8(&mut self, addr: u32, val: u8) {
+        match addr {
+            MAIN_RAM_BASE..=0x023F_FFFF => {
+                NdsBus::write_region(&mut self.bus.memory.main_ram, MAIN_RAM_BASE, addr, val)
+            }
+            SHARED_WRAM_BASE..=0x0300_7FFF => {
+                NdsBus::write_region(&mut self.bus.memory.shared_wram, SHARED_WRAM_BASE, addr, val)
+            }
+            IO_BASE..=0x0400_0FFF => self.bus.write_arm9_io_byte(addr, val),
+            PALETTE_BASE..=0x0500_0FFF => {
+                NdsBus::write_region(&mut self.bus.memory.palette, PALETTE_BASE, addr, val)
+            }
+            VRAM_BASE..=0x060A_3FFF => NdsBus::write_region(&mut self.bus.memory.vram, VRAM_BASE, addr, val),
+            OAM_BASE..=0x0700_03FF => NdsBus::write_region(&mut self.bus.memory.oam, OAM_BASE, addr, val),
+            _ => {}
+        }
+    }
+
+    fn write16(&mut self, addr: u32, val: u16) {
+        let bytes = val.to_le_bytes();
+        self.write8(addr, bytes[0]);
+        self.write8(addr.wrapping_add(1), bytes[1]);
+    }
+
+    fn write32(&mut self, addr: u32, val: u32) {
+        let bytes = val.to_le_bytes();
+        self.write8(addr, bytes[0]);
+        self.write8(addr.wrapping_add(1), bytes[1]);
+        self.write8(addr.wrapping_add(2), bytes[2]);
+        self.write8(addr.wrapping_add(3), bytes[3]);
     }
 }
 

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::ops::{Deref, DerefMut};
 
-use crate::cpu::arm7tdmi::{Arm7Tdmi, CpuMode};
+use crate::cpu::arm7tdmi::Arm7Tdmi;
 use crate::memory::nds_bus::NdsBus;
 use crate::{NDS_HEIGHT, NDS_WIDTH};
 
@@ -107,28 +108,32 @@ impl NdsRomHeader {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NdsArm9 {
-    pub regs: [u32; 16],
-    pub cpsr: u32,
-    pub cycles: u64,
-    pub halted: bool,
+    cpu: Arm7Tdmi,
 }
 
 impl NdsArm9 {
     pub fn new(entry_address: u32) -> Self {
-        let mut regs = [0; 16];
-        regs[15] = entry_address & !3;
-        regs[13] = 0x0380_FF00;
+        let mut cpu = Arm7Tdmi::new();
+        cpu.regs[15] = entry_address & !3;
+        cpu.regs[13] = 0x0203_FF00;
+        cpu.banked_regs[2][5] = 0x0203_FE00;
+        cpu.banked_regs[3][5] = 0x0203_FF80;
 
-        Self {
-            regs,
-            cpsr: CpuMode::System as u32,
-            cycles: 0,
-            halted: false,
-        }
+        Self { cpu }
     }
+}
 
-    pub fn advance_placeholder(&mut self, cycles: u32) {
-        self.cycles += cycles as u64;
+impl Deref for NdsArm9 {
+    type Target = Arm7Tdmi;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cpu
+    }
+}
+
+impl DerefMut for NdsArm9 {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cpu
     }
 }
 
@@ -204,9 +209,35 @@ impl NdsEmulator {
         }
     }
 
-    pub fn run_frame(&mut self) -> &[u32] {
+    fn run_arm9_slice(&mut self, target_cycles: u32) {
+        let mut arm9_cycles = 0;
+
+        while arm9_cycles < target_cycles {
+            if self.bus.arm9_halt {
+                self.arm9.halted = true;
+                self.bus.arm9_halt = false;
+            }
+
+            if self.bus.arm9_check_irq() {
+                self.arm9.handle_irq();
+            }
+
+            let arm9 = &mut self.arm9;
+            let bus = &mut self.bus;
+            let cycles = {
+                let mut arm9_bus = bus.arm9_view();
+                arm9.step(&mut arm9_bus)
+            };
+
+            bus.tick_arm9(cycles);
+            arm9_cycles += cycles;
+        }
+    }
+
+    fn run_arm7_slice(&mut self, target_cycles: u32) {
         let mut arm7_cycles = 0;
-        while arm7_cycles < NDS_ARM7_CYCLES_PER_FRAME {
+
+        while arm7_cycles < target_cycles {
             if self.bus.halt {
                 self.arm7.halted = true;
                 self.bus.halt = false;
@@ -220,8 +251,11 @@ impl NdsEmulator {
             self.bus.tick(cycles);
             arm7_cycles += cycles;
         }
+    }
 
-        self.arm9.advance_placeholder(NDS_ARM9_CYCLES_PER_FRAME);
+    pub fn run_frame(&mut self) -> &[u32] {
+        self.run_arm9_slice(NDS_ARM9_CYCLES_PER_FRAME);
+        self.run_arm7_slice(NDS_ARM7_CYCLES_PER_FRAME);
         self.total_frames += 1;
         self.refresh_placeholder_framebuffer();
         &self.framebuffer
@@ -266,9 +300,13 @@ mod tests {
         rom[0x038..0x03C].copy_from_slice(&0x0380_0000u32.to_le_bytes());
         rom[0x03C..0x040].copy_from_slice(&0x0000_0010u32.to_le_bytes());
 
-        for (index, byte) in (1u8..=16).enumerate() {
-            rom[0x200 + index] = byte;
-            rom[0x300 + index] = byte.wrapping_add(0x40);
+        rom[0x200..0x204].copy_from_slice(&0xE581_0000u32.to_le_bytes());
+        rom[0x204..0x208].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        rom[0x300..0x304].copy_from_slice(&0xE581_0000u32.to_le_bytes());
+        rom[0x304..0x308].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        for (index, byte) in (0u8..8).enumerate() {
+            rom[0x208 + index] = byte.wrapping_add(0x80);
+            rom[0x308 + index] = byte.wrapping_add(0xC0);
         }
 
         rom
@@ -295,6 +333,19 @@ mod tests {
         assert_eq!(emu.arm7.regs[15], 0x0380_0000);
         assert_eq!(&emu.bus.memory.main_ram[..16], &rom[0x200..0x210]);
         assert_eq!(&emu.bus.memory.arm7_wram[..8], &rom[0x300..0x308]);
+    }
+
+    #[test]
+    fn nds_emulator_runs_arm9_against_shared_bus_state() {
+        let rom = build_test_rom();
+        let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
+
+        emu.arm9.regs[0] = 0xCAFE_BABE;
+        emu.arm9.regs[1] = 0x0200_0020;
+        emu.run_arm9_slice(3);
+
+        assert_eq!(u32::from_le_bytes(emu.bus.memory.main_ram[0x20..0x24].try_into().unwrap()), 0xCAFE_BABE);
+        assert!(emu.bus.arm9_cycles >= 3);
     }
 
     #[test]

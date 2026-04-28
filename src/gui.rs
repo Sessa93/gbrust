@@ -942,7 +942,7 @@ impl EmuApp {
             emu.bus.input.touchscreen_pressed,
         ));
         ui.label(format!(
-            "IME={} IE=0x{:08X} IF=0x{:08X} POSTFLG=0x{:02X} HALT={} Bus cycles={}",
+            "ARM7 IME={} IE=0x{:08X} IF=0x{:08X} POSTFLG=0x{:02X} HALT={} Bus cycles={}",
             emu.bus.ime,
             emu.bus.ie,
             emu.bus.iflag,
@@ -972,6 +972,15 @@ impl EmuApp {
             crate::cpu::arm7tdmi::CpuMode::from_bits(emu.arm9.cpsr),
             emu.arm9.halted,
             emu.arm9.cycles,
+        ));
+        ui.label(format!(
+            "ARM9 IME={} IE=0x{:08X} IF=0x{:08X} POSTFLG=0x{:02X} HALT={} Bus cycles={}",
+            emu.bus.arm9_ime,
+            emu.bus.arm9_ie,
+            emu.bus.arm9_iflag,
+            emu.bus.arm9_postflg,
+            emu.bus.arm9_halt,
+            emu.bus.arm9_cycles,
         ));
 
         ui.separator();
