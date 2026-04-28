@@ -333,6 +333,10 @@ impl NdsEmulator {
         bg_ref_y: [i32; 2],
         master_bright: u16,
     ) -> bool {
+        if !supports_2d_layer_render(dispcnt) {
+            return false;
+        }
+
         let active_layers = active_2d_bgs(dispcnt, bgcnt);
         if active_layers.is_empty() {
             return false;
@@ -476,6 +480,22 @@ impl NdsEmulator {
     pub fn audio_buffer(&mut self) -> Vec<f32> {
         Vec::new()
     }
+
+    pub fn video_warning(&self) -> Option<String> {
+        let mut warnings = Vec::new();
+        if let Some(main) = describe_video_warning("Main", self.bus.ppu_main.dispcnt, self.bus.ppu_main.disp3dcnt) {
+            warnings.push(main);
+        }
+        if let Some(sub) = describe_video_warning("Sub", self.bus.ppu_sub.dispcnt, self.bus.ppu_sub.disp3dcnt) {
+            warnings.push(sub);
+        }
+
+        if warnings.is_empty() {
+            None
+        } else {
+            Some(format!("DS video is partial: {}", warnings.join(" | ")))
+        }
+    }
 }
 
 fn argb(r: u8, g: u8, b: u8) -> u32 {
@@ -515,6 +535,34 @@ fn rgb555_to_argb(color: u16) -> u32 {
 
 fn read_color_16(region: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([region[offset], region[offset + 1]])
+}
+
+fn supports_2d_layer_render(dispcnt: u32) -> bool {
+    let display_mode = (dispcnt >> 16) & 0x3;
+    let bg_mode = dispcnt & 0x7;
+    display_mode == 0 && bg_mode <= 2
+}
+
+fn describe_video_warning(name: &str, dispcnt: u32, disp3dcnt: u16) -> Option<String> {
+    let display_mode = (dispcnt >> 16) & 0x3;
+    let bg_mode = dispcnt & 0x7;
+    let mut reasons = Vec::new();
+
+    if display_mode != 0 {
+        reasons.push(format!("display mode {}", display_mode));
+    }
+    if bg_mode > 2 {
+        reasons.push(format!("BG mode {}", bg_mode));
+    }
+    if disp3dcnt != 0 {
+        reasons.push("3D engine state".to_string());
+    }
+
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(format!("{} engine uses {}", name, reasons.join(", ")))
+    }
 }
 
 fn active_2d_bgs(dispcnt: u32, bgcnt: [u16; 4]) -> Vec<NdsBgLayer> {
@@ -707,7 +755,8 @@ fn sample_affine_bg_pixel(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_master_brightness, rgb555_to_argb, NdsEmulator, NdsRomHeader, BG_ENABLE_BITS,
+        apply_master_brightness, describe_video_warning, rgb555_to_argb, supports_2d_layer_render,
+        NdsEmulator, NdsRomHeader, BG_ENABLE_BITS,
         MAIN_BG_PALETTE_OFFSET, MAIN_SCREEN_VRAM_OFFSET, NDS_SCREEN_HEIGHT, NDS_WIDTH,
         SUB_BG_PALETTE_OFFSET, SUB_SCREEN_VRAM_OFFSET,
     };
@@ -888,5 +937,20 @@ mod tests {
         emu.run_frame();
 
         assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x7C00));
+    }
+
+    #[test]
+    fn nds_2d_renderer_rejects_unsupported_display_modes() {
+        assert!(supports_2d_layer_render(BG_ENABLE_BITS[0]));
+        assert!(!supports_2d_layer_render(1 << 16));
+        assert!(!supports_2d_layer_render(3));
+    }
+
+    #[test]
+    fn nds_video_warning_reports_unsupported_modes() {
+        let warning = describe_video_warning("Main", (1 << 16) | 5, 1).expect("warning expected");
+        assert!(warning.contains("display mode 1"));
+        assert!(warning.contains("BG mode 5"));
+        assert!(warning.contains("3D engine state"));
     }
 }

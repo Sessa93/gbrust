@@ -1615,6 +1615,12 @@ impl EmuApp {
                     ui.label(self.console_name());
                     ui.label(self.resolution_label());
                     ui.monospace(self.rom_name());
+                    if let Emulator::Nds(emu) = &self.emu {
+                        if let Some(warning) = emu.video_warning() {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(warning).color(Color32::from_rgb(225, 180, 96)).small());
+                        }
+                    }
                 });
 
                 ui.group(|ui| {
