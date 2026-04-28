@@ -963,6 +963,15 @@ impl EmuApp {
             emu.bus.read_dispstat_value(),
             emu.bus.read_arm9_dispstat_value(),
         ));
+        ui.label(format!(
+            "PPU A DISPCNT=0x{:08X} BG0CNT=0x{:04X} BRIGHT=0x{:04X} | PPU B DISPCNT=0x{:08X} BG0CNT=0x{:04X} BRIGHT=0x{:04X}",
+            emu.bus.ppu_main.dispcnt,
+            emu.bus.ppu_main.bgcnt[0],
+            emu.bus.ppu_main.master_bright,
+            emu.bus.ppu_sub.dispcnt,
+            emu.bus.ppu_sub.bgcnt[0],
+            emu.bus.ppu_sub.master_bright,
+        ));
 
         ui.separator();
         ui.label(RichText::new("ARM9").strong());

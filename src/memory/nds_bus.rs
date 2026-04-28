@@ -9,7 +9,7 @@ use crate::timer::GbaTimers;
 
 const ARM7_BIOS_SIZE: usize = 0x4000;
 const ARM9_BIOS_SIZE: usize = 0x8000;
-const IO_SIZE: usize = 0x1000;
+const IO_SIZE: usize = 0x2000;
 const ARM9_BIOS_BASE: u32 = 0xFFFF_0000;
 const SCANLINE_CYCLES: u32 = 1232;
 const HBLANK_START_CYCLES: u32 = 960;
@@ -29,11 +29,18 @@ const OAM_BASE: u32 = 0x0700_0000;
 const OAM_SIZE: usize = 0x1000;
 const CART_BASE: u32 = 0x0800_0000;
 const IO_BASE: u32 = 0x0400_0000;
+const IO_END: u32 = IO_BASE + IO_SIZE as u32 - 1;
+const PPU_MAIN_BASE: u32 = 0x0400_0000;
+const PPU_SUB_BASE: u32 = 0x0400_1000;
+const PPU_MAIN_END: u32 = PPU_MAIN_BASE + 0x06D;
+const PPU_SUB_END: u32 = PPU_SUB_BASE + 0x06D;
 
 const REG_KEYINPUT: u32 = 0x0400_0130;
 const REG_KEYINPUT_HI: u32 = REG_KEYINPUT + 1;
 const REG_EXTKEYIN: u32 = 0x0400_0136;
 const REG_EXTKEYIN_HI: u32 = REG_EXTKEYIN + 1;
+const REG_DISPCNT: u32 = 0x0400_0000;
+const REG_DISPCNT_END: u32 = REG_DISPCNT + 3;
 const REG_DISPSTAT: u32 = 0x0400_0004;
 const REG_DISPSTAT_HI: u32 = REG_DISPSTAT + 1;
 const REG_VCOUNT: u32 = 0x0400_0006;
@@ -85,6 +92,213 @@ pub struct NdsMemory {
     pub vram: Vec<u8>,
     pub palette: Vec<u8>,
     pub oam: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NdsPpuRegisters {
+    pub dispcnt: u32,
+    pub bgcnt: [u16; 4],
+    pub bghofs: [u16; 4],
+    pub bgvofs: [u16; 4],
+    pub bg_pa: [i16; 2],
+    pub bg_pb: [i16; 2],
+    pub bg_pc: [i16; 2],
+    pub bg_pd: [i16; 2],
+    pub bg_ref_x: [i32; 2],
+    pub bg_ref_y: [i32; 2],
+    pub winh: [u16; 2],
+    pub winv: [u16; 2],
+    pub winin: u16,
+    pub winout: u16,
+    pub mosaic: u16,
+    pub bldcnt: u16,
+    pub bldalpha: u16,
+    pub bldy: u16,
+    pub disp3dcnt: u16,
+    pub dispcapcnt: u32,
+    pub master_bright: u16,
+}
+
+impl NdsPpuRegisters {
+    fn new() -> Self {
+        Self {
+            dispcnt: 0,
+            bgcnt: [0; 4],
+            bghofs: [0; 4],
+            bgvofs: [0; 4],
+            bg_pa: [0x100; 2],
+            bg_pb: [0; 2],
+            bg_pc: [0; 2],
+            bg_pd: [0x100; 2],
+            bg_ref_x: [0; 2],
+            bg_ref_y: [0; 2],
+            winh: [0; 2],
+            winv: [0; 2],
+            winin: 0,
+            winout: 0,
+            mosaic: 0,
+            bldcnt: 0,
+            bldalpha: 0,
+            bldy: 0,
+            disp3dcnt: 0,
+            dispcapcnt: 0,
+            master_bright: 0,
+        }
+    }
+
+    fn read_byte(&self, offset: u32) -> u8 {
+        match offset {
+            0x000..=0x003 => ((self.dispcnt >> ((offset & 3) * 8)) & 0xFF) as u8,
+            0x008..=0x00F => {
+                let bg = ((offset - 0x008) / 2) as usize;
+                let value = self.bgcnt[bg];
+                if offset & 1 == 0 { value as u8 } else { (value >> 8) as u8 }
+            }
+            0x010..=0x01F => {
+                let reg = ((offset - 0x010) / 2) as usize;
+                let bg = reg / 2;
+                let is_vofs = reg & 1 == 1;
+                let value = if is_vofs { self.bgvofs[bg] } else { self.bghofs[bg] };
+                if offset & 1 == 0 { value as u8 } else { (value >> 8) as u8 }
+            }
+            0x020..=0x03F => self.read_affine_byte(offset),
+            0x040 => self.winh[0] as u8,
+            0x041 => (self.winh[0] >> 8) as u8,
+            0x042 => self.winh[1] as u8,
+            0x043 => (self.winh[1] >> 8) as u8,
+            0x044 => self.winv[0] as u8,
+            0x045 => (self.winv[0] >> 8) as u8,
+            0x046 => self.winv[1] as u8,
+            0x047 => (self.winv[1] >> 8) as u8,
+            0x048 => self.winin as u8,
+            0x049 => (self.winin >> 8) as u8,
+            0x04A => self.winout as u8,
+            0x04B => (self.winout >> 8) as u8,
+            0x04C => self.mosaic as u8,
+            0x04D => (self.mosaic >> 8) as u8,
+            0x050 => self.bldcnt as u8,
+            0x051 => (self.bldcnt >> 8) as u8,
+            0x052 => self.bldalpha as u8,
+            0x053 => (self.bldalpha >> 8) as u8,
+            0x054 => self.bldy as u8,
+            0x055 => (self.bldy >> 8) as u8,
+            0x060 => self.disp3dcnt as u8,
+            0x061 => (self.disp3dcnt >> 8) as u8,
+            0x064..=0x067 => ((self.dispcapcnt >> ((offset - 0x064) * 8)) & 0xFF) as u8,
+            0x06C => self.master_bright as u8,
+            0x06D => (self.master_bright >> 8) as u8,
+            _ => 0,
+        }
+    }
+
+    fn write_byte(&mut self, offset: u32, value: u8) {
+        match offset {
+            0x000..=0x003 => {
+                let shift = (offset & 3) * 8;
+                self.dispcnt = (self.dispcnt & !(0xFF << shift)) | ((value as u32) << shift);
+            }
+            0x008..=0x00F => {
+                let bg = ((offset - 0x008) / 2) as usize;
+                if offset & 1 == 0 {
+                    self.bgcnt[bg] = (self.bgcnt[bg] & 0xFF00) | value as u16;
+                } else {
+                    self.bgcnt[bg] = (self.bgcnt[bg] & 0x00FF) | ((value as u16) << 8);
+                }
+            }
+            0x010..=0x01F => {
+                let reg = ((offset - 0x010) / 2) as usize;
+                let bg = reg / 2;
+                let target = if reg & 1 == 1 { &mut self.bgvofs[bg] } else { &mut self.bghofs[bg] };
+                if offset & 1 == 0 {
+                    *target = (*target & 0xFF00) | value as u16;
+                } else {
+                    *target = (*target & 0x00FF) | ((value as u16) << 8);
+                }
+            }
+            0x020..=0x03F => self.write_affine_byte(offset, value),
+            0x040 => self.winh[0] = (self.winh[0] & 0xFF00) | value as u16,
+            0x041 => self.winh[0] = (self.winh[0] & 0x00FF) | ((value as u16) << 8),
+            0x042 => self.winh[1] = (self.winh[1] & 0xFF00) | value as u16,
+            0x043 => self.winh[1] = (self.winh[1] & 0x00FF) | ((value as u16) << 8),
+            0x044 => self.winv[0] = (self.winv[0] & 0xFF00) | value as u16,
+            0x045 => self.winv[0] = (self.winv[0] & 0x00FF) | ((value as u16) << 8),
+            0x046 => self.winv[1] = (self.winv[1] & 0xFF00) | value as u16,
+            0x047 => self.winv[1] = (self.winv[1] & 0x00FF) | ((value as u16) << 8),
+            0x048 => self.winin = (self.winin & 0xFF00) | value as u16,
+            0x049 => self.winin = (self.winin & 0x00FF) | ((value as u16) << 8),
+            0x04A => self.winout = (self.winout & 0xFF00) | value as u16,
+            0x04B => self.winout = (self.winout & 0x00FF) | ((value as u16) << 8),
+            0x04C => self.mosaic = (self.mosaic & 0xFF00) | value as u16,
+            0x04D => self.mosaic = (self.mosaic & 0x00FF) | ((value as u16) << 8),
+            0x050 => self.bldcnt = (self.bldcnt & 0xFF00) | value as u16,
+            0x051 => self.bldcnt = (self.bldcnt & 0x00FF) | ((value as u16) << 8),
+            0x052 => self.bldalpha = (self.bldalpha & 0xFF00) | value as u16,
+            0x053 => self.bldalpha = (self.bldalpha & 0x00FF) | ((value as u16) << 8),
+            0x054 => self.bldy = (self.bldy & 0xFF00) | value as u16,
+            0x055 => self.bldy = (self.bldy & 0x00FF) | ((value as u16) << 8),
+            0x060 => self.disp3dcnt = (self.disp3dcnt & 0xFF00) | value as u16,
+            0x061 => self.disp3dcnt = (self.disp3dcnt & 0x00FF) | ((value as u16) << 8),
+            0x064..=0x067 => {
+                let shift = (offset - 0x064) * 8;
+                self.dispcapcnt = (self.dispcapcnt & !(0xFF << shift)) | ((value as u32) << shift);
+            }
+            0x06C => self.master_bright = (self.master_bright & 0xFF00) | value as u16,
+            0x06D => self.master_bright = (self.master_bright & 0x00FF) | ((value as u16) << 8),
+            _ => {}
+        }
+    }
+
+    fn read_affine_byte(&self, offset: u32) -> u8 {
+        let bg = if offset >= 0x30 { 1usize } else { 0usize };
+        match offset & 0x0F {
+            0x0 => self.bg_pa[bg] as u8,
+            0x1 => (self.bg_pa[bg] >> 8) as u8,
+            0x2 => self.bg_pb[bg] as u8,
+            0x3 => (self.bg_pb[bg] >> 8) as u8,
+            0x4 => self.bg_pc[bg] as u8,
+            0x5 => (self.bg_pc[bg] >> 8) as u8,
+            0x6 => self.bg_pd[bg] as u8,
+            0x7 => (self.bg_pd[bg] >> 8) as u8,
+            0x8..=0xB => ((self.bg_ref_x[bg] as u32 >> ((offset & 0x03) * 8)) & 0xFF) as u8,
+            0xC..=0xF => ((self.bg_ref_y[bg] as u32 >> ((offset & 0x03) * 8)) & 0xFF) as u8,
+            _ => 0,
+        }
+    }
+
+    fn write_affine_byte(&mut self, offset: u32, value: u8) {
+        let bg = if offset >= 0x30 { 1usize } else { 0usize };
+        match offset & 0x0F {
+            0x0 => self.bg_pa[bg] = (self.bg_pa[bg] & !0x00FF) | value as i16,
+            0x1 => self.bg_pa[bg] = (self.bg_pa[bg] & 0x00FF) | ((value as i16) << 8),
+            0x2 => self.bg_pb[bg] = (self.bg_pb[bg] & !0x00FF) | value as i16,
+            0x3 => self.bg_pb[bg] = (self.bg_pb[bg] & 0x00FF) | ((value as i16) << 8),
+            0x4 => self.bg_pc[bg] = (self.bg_pc[bg] & !0x00FF) | value as i16,
+            0x5 => self.bg_pc[bg] = (self.bg_pc[bg] & 0x00FF) | ((value as i16) << 8),
+            0x6 => self.bg_pd[bg] = (self.bg_pd[bg] & !0x00FF) | value as i16,
+            0x7 => self.bg_pd[bg] = (self.bg_pd[bg] & 0x00FF) | ((value as i16) << 8),
+            0x8..=0xB => {
+                let shift = (offset & 0x03) * 8;
+                let mut raw = self.bg_ref_x[bg] as u32;
+                raw = (raw & !(0xFF << shift)) | ((value as u32) << shift);
+                self.bg_ref_x[bg] = if raw & (1 << 27) != 0 {
+                    (raw | 0xF000_0000) as i32
+                } else {
+                    (raw & 0x0FFF_FFFF) as i32
+                };
+            }
+            0xC..=0xF => {
+                let shift = (offset & 0x03) * 8;
+                let mut raw = self.bg_ref_y[bg] as u32;
+                raw = (raw & !(0xFF << shift)) | ((value as u32) << shift);
+                self.bg_ref_y[bg] = if raw & (1 << 27) != 0 {
+                    (raw | 0xF000_0000) as i32
+                } else {
+                    (raw & 0x0FFF_FFFF) as i32
+                };
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -184,6 +398,8 @@ pub struct NdsBus {
     pub memory: NdsMemory,
     pub io: Vec<u8>,
     pub video: NdsVideoState,
+    pub ppu_main: NdsPpuRegisters,
+    pub ppu_sub: NdsPpuRegisters,
     pub dispstat: u16,
     pub arm9_dispstat: u16,
     pub timers: GbaTimers,
@@ -220,6 +436,8 @@ impl NdsBus {
             memory,
             io: vec![0; IO_SIZE],
             video: NdsVideoState::new(),
+            ppu_main: NdsPpuRegisters::new(),
+            ppu_sub: NdsPpuRegisters::new(),
             dispstat: 0,
             arm9_dispstat: 0,
             timers: GbaTimers::new(),
@@ -312,6 +530,40 @@ impl NdsBus {
 
     pub fn read_arm9_dispstat_value(&self) -> u16 {
         self.read_dispstat(NdsCpu::Arm9)
+    }
+
+    fn read_ppu_byte(&self, addr: u32) -> Option<u8> {
+        match addr {
+            PPU_MAIN_BASE..=PPU_MAIN_END => {
+                let offset = addr - PPU_MAIN_BASE;
+                if (0x004..=0x007).contains(&offset) {
+                    None
+                } else {
+                    Some(self.ppu_main.read_byte(offset))
+                }
+            }
+            PPU_SUB_BASE..=PPU_SUB_END => Some(self.ppu_sub.read_byte(addr - PPU_SUB_BASE)),
+            _ => None,
+        }
+    }
+
+    fn write_ppu_byte(&mut self, addr: u32, value: u8) -> bool {
+        match addr {
+            PPU_MAIN_BASE..=PPU_MAIN_END => {
+                let offset = addr - PPU_MAIN_BASE;
+                if (0x004..=0x007).contains(&offset) {
+                    false
+                } else {
+                    self.ppu_main.write_byte(offset, value);
+                    true
+                }
+            }
+            PPU_SUB_BASE..=PPU_SUB_END => {
+                self.ppu_sub.write_byte(addr - PPU_SUB_BASE, value);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn in_vblank(&self) -> bool {
@@ -631,7 +883,7 @@ impl NdsBus {
                 MAIN_RAM_BASE..=0x023F_FFFF => Self::read_region(&self.memory.main_ram, MAIN_RAM_BASE, addr),
                 SHARED_WRAM_BASE..=0x0300_7FFF => Self::read_region(&self.memory.shared_wram, SHARED_WRAM_BASE, addr),
                 ARM7_WRAM_BASE..=0x0380_FFFF => Self::read_region(&self.memory.arm7_wram, ARM7_WRAM_BASE, addr),
-                IO_BASE..=0x0400_0FFF => self.read_io_byte(addr),
+                IO_BASE..=IO_END => self.read_io_byte(addr),
                 PALETTE_BASE..=0x0500_0FFF => Self::read_region(&self.memory.palette, PALETTE_BASE, addr),
                 VRAM_BASE..=0x060A_3FFF => Self::read_region(&self.memory.vram, VRAM_BASE, addr),
                 OAM_BASE..=0x0700_03FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
@@ -644,7 +896,7 @@ impl NdsBus {
             NdsCpu::Arm9 => match addr {
                 MAIN_RAM_BASE..=0x023F_FFFF => Self::read_region(&self.memory.main_ram, MAIN_RAM_BASE, addr),
                 SHARED_WRAM_BASE..=0x0300_7FFF => Self::read_region(&self.memory.shared_wram, SHARED_WRAM_BASE, addr),
-                IO_BASE..=0x0400_0FFF => self.read_arm9_io_byte(addr),
+                IO_BASE..=IO_END => self.read_arm9_io_byte(addr),
                 PALETTE_BASE..=0x0500_0FFF => Self::read_region(&self.memory.palette, PALETTE_BASE, addr),
                 VRAM_BASE..=0x060A_3FFF => Self::read_region(&self.memory.vram, VRAM_BASE, addr),
                 OAM_BASE..=0x0700_03FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
@@ -677,7 +929,7 @@ impl NdsBus {
                 MAIN_RAM_BASE..=0x023F_FFFF => Self::write_region(&mut self.memory.main_ram, MAIN_RAM_BASE, addr, value),
                 SHARED_WRAM_BASE..=0x0300_7FFF => Self::write_region(&mut self.memory.shared_wram, SHARED_WRAM_BASE, addr, value),
                 ARM7_WRAM_BASE..=0x0380_FFFF => Self::write_region(&mut self.memory.arm7_wram, ARM7_WRAM_BASE, addr, value),
-                IO_BASE..=0x0400_0FFF => self.write_io_byte(addr, value),
+                IO_BASE..=IO_END => self.write_io_byte(addr, value),
                 PALETTE_BASE..=0x0500_0FFF => Self::write_region(&mut self.memory.palette, PALETTE_BASE, addr, value),
                 VRAM_BASE..=0x060A_3FFF => Self::write_region(&mut self.memory.vram, VRAM_BASE, addr, value),
                 OAM_BASE..=0x0700_03FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, value),
@@ -686,7 +938,7 @@ impl NdsBus {
             NdsCpu::Arm9 => match addr {
                 MAIN_RAM_BASE..=0x023F_FFFF => Self::write_region(&mut self.memory.main_ram, MAIN_RAM_BASE, addr, value),
                 SHARED_WRAM_BASE..=0x0300_7FFF => Self::write_region(&mut self.memory.shared_wram, SHARED_WRAM_BASE, addr, value),
-                IO_BASE..=0x0400_0FFF => self.write_arm9_io_byte(addr, value),
+                IO_BASE..=IO_END => self.write_arm9_io_byte(addr, value),
                 PALETTE_BASE..=0x0500_0FFF => Self::write_region(&mut self.memory.palette, PALETTE_BASE, addr, value),
                 VRAM_BASE..=0x060A_3FFF => Self::write_region(&mut self.memory.vram, VRAM_BASE, addr, value),
                 OAM_BASE..=0x0700_03FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, value),
@@ -711,10 +963,12 @@ impl NdsBus {
 
     fn read_io_byte(&self, addr: u32) -> u8 {
         match addr {
+            REG_DISPCNT..=REG_DISPCNT_END => self.ppu_main.read_byte(addr - PPU_MAIN_BASE),
             REG_DISPSTAT => self.read_dispstat(NdsCpu::Arm7) as u8,
             REG_DISPSTAT_HI => (self.read_dispstat(NdsCpu::Arm7) >> 8) as u8,
             REG_VCOUNT => self.video.vcount as u8,
             REG_VCOUNT_HI => (self.video.vcount >> 8) as u8,
+            _ if self.read_ppu_byte(addr).is_some() => self.read_ppu_byte(addr).unwrap_or(0),
             0x0400_00B0..=0x0400_00DF => self.dma.read(addr - IO_BASE),
             0x0400_0100..=0x0400_010F => self.timers.read(addr - IO_BASE),
             REG_KEYINPUT => self.input.read_keyinput() as u8,
@@ -750,10 +1004,12 @@ impl NdsBus {
 
     fn read_arm9_io_byte(&self, addr: u32) -> u8 {
         match addr {
+            REG_DISPCNT..=REG_DISPCNT_END => self.ppu_main.read_byte(addr - PPU_MAIN_BASE),
             REG_DISPSTAT => self.read_dispstat(NdsCpu::Arm9) as u8,
             REG_DISPSTAT_HI => (self.read_dispstat(NdsCpu::Arm9) >> 8) as u8,
             REG_VCOUNT => self.video.vcount as u8,
             REG_VCOUNT_HI => (self.video.vcount >> 8) as u8,
+            _ if self.read_ppu_byte(addr).is_some() => self.read_ppu_byte(addr).unwrap_or(0),
             0x0400_00B0..=0x0400_00DF => self.arm9_dma.read(addr - IO_BASE),
             0x0400_0100..=0x0400_010F => self.arm9_timers.read(addr - IO_BASE),
             REG_IPCSYNC => self.read_ipcsync(NdsCpu::Arm9) as u8,
@@ -785,8 +1041,12 @@ impl NdsBus {
 
     fn write_io_byte(&mut self, addr: u32, value: u8) {
         match addr {
+            REG_DISPCNT..=REG_DISPCNT_END => {
+                self.ppu_main.write_byte(addr - PPU_MAIN_BASE, value);
+            }
             REG_DISPSTAT => self.write_dispstat_byte(NdsCpu::Arm7, 0, value),
             REG_DISPSTAT_HI => self.write_dispstat_byte(NdsCpu::Arm7, 1, value),
+            _ if self.write_ppu_byte(addr, value) => {}
             0x0400_00B0..=0x0400_00DF => self.dma.write(addr - IO_BASE, value),
             0x0400_0100..=0x0400_010F => self.timers.write(addr - IO_BASE, value),
             REG_IPCSYNC => self.write_ipcsync(NdsCpu::Arm7, value as u16),
@@ -813,8 +1073,12 @@ impl NdsBus {
 
     fn write_arm9_io_byte(&mut self, addr: u32, value: u8) {
         match addr {
+            REG_DISPCNT..=REG_DISPCNT_END => {
+                self.ppu_main.write_byte(addr - PPU_MAIN_BASE, value);
+            }
             REG_DISPSTAT => self.write_dispstat_byte(NdsCpu::Arm9, 0, value),
             REG_DISPSTAT_HI => self.write_dispstat_byte(NdsCpu::Arm9, 1, value),
+            _ if self.write_ppu_byte(addr, value) => {}
             0x0400_00B0..=0x0400_00DF => self.arm9_dma.write(addr - IO_BASE, value),
             0x0400_0100..=0x0400_010F => self.arm9_timers.write(addr - IO_BASE, value),
             REG_IPCSYNC => self.write_ipcsync(NdsCpu::Arm9, value as u16),
@@ -859,7 +1123,7 @@ impl Arm7Bus for NdsArm9Bus<'_> {
             SHARED_WRAM_BASE..=0x0300_7FFF => {
                 NdsBus::read_region(&self.bus.memory.shared_wram, SHARED_WRAM_BASE, addr)
             }
-            IO_BASE..=0x0400_0FFF => self.bus.read_arm9_io_byte(addr),
+            IO_BASE..=IO_END => self.bus.read_arm9_io_byte(addr),
             PALETTE_BASE..=0x0500_0FFF => NdsBus::read_region(&self.bus.memory.palette, PALETTE_BASE, addr),
             VRAM_BASE..=0x060A_3FFF => NdsBus::read_region(&self.bus.memory.vram, VRAM_BASE, addr),
             OAM_BASE..=0x0700_03FF => NdsBus::read_region(&self.bus.memory.oam, OAM_BASE, addr),
@@ -899,7 +1163,7 @@ impl Arm7Bus for NdsArm9Bus<'_> {
             SHARED_WRAM_BASE..=0x0300_7FFF => {
                 NdsBus::write_region(&mut self.bus.memory.shared_wram, SHARED_WRAM_BASE, addr, val)
             }
-            IO_BASE..=0x0400_0FFF => self.bus.write_arm9_io_byte(addr, val),
+            IO_BASE..=IO_END => self.bus.write_arm9_io_byte(addr, val),
             PALETTE_BASE..=0x0500_0FFF => {
                 NdsBus::write_region(&mut self.bus.memory.palette, PALETTE_BASE, addr, val)
             }
@@ -938,7 +1202,7 @@ impl Arm7Bus for NdsBus {
                 Self::read_region(&self.memory.shared_wram, SHARED_WRAM_BASE, addr)
             }
             ARM7_WRAM_BASE..=0x0380_FFFF => Self::read_region(&self.memory.arm7_wram, ARM7_WRAM_BASE, addr),
-            IO_BASE..=0x0400_0FFF => self.read_io_byte(addr),
+            IO_BASE..=IO_END => self.read_io_byte(addr),
             PALETTE_BASE..=0x0500_0FFF => Self::read_region(&self.memory.palette, PALETTE_BASE, addr),
             VRAM_BASE..=0x060A_3FFF => Self::read_region(&self.memory.vram, VRAM_BASE, addr),
             OAM_BASE..=0x0700_03FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
@@ -978,7 +1242,7 @@ impl Arm7Bus for NdsBus {
             ARM7_WRAM_BASE..=0x0380_FFFF => {
                 Self::write_region(&mut self.memory.arm7_wram, ARM7_WRAM_BASE, addr, val)
             }
-            IO_BASE..=0x0400_0FFF => self.write_io_byte(addr, val),
+            IO_BASE..=IO_END => self.write_io_byte(addr, val),
             PALETTE_BASE..=0x0500_0FFF => Self::write_region(&mut self.memory.palette, PALETTE_BASE, addr, val),
             VRAM_BASE..=0x060A_3FFF => Self::write_region(&mut self.memory.vram, VRAM_BASE, addr, val),
             OAM_BASE..=0x0700_03FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, val),
@@ -1008,11 +1272,14 @@ impl Arm7Bus for NdsBus {
 
 #[cfg(test)]
 mod tests {
-    use super::{NdsBus, REG_DISPSTAT, REG_EXTKEYIN, REG_IPCFIFOCNT, REG_IPCFIFOSEND, REG_KEYINPUT, REG_VCOUNT};
+    use super::{NdsBus, REG_DISPCNT, REG_DISPSTAT, REG_EXTKEYIN, REG_IPCFIFOCNT, REG_IPCFIFOSEND, REG_KEYINPUT, REG_VCOUNT};
     use crate::cpu::arm7tdmi::{Arm7Bus, Arm7Tdmi};
     use crate::emulator::nds::NdsRomHeader;
     use crate::input::NdsKey;
 
+    const REG_SUB_DISPCNT: u32 = 0x0400_1000;
+    const REG_SUB_BG0CNT: u32 = 0x0400_1008;
+    const REG_SUB_MASTER_BRIGHT: u32 = 0x0400_106C;
     const REG_DMA0SAD: u32 = 0x0400_00B0;
     const REG_DMA0DAD: u32 = 0x0400_00B4;
     const REG_DMA0CNT_L: u32 = 0x0400_00B8;
@@ -1151,6 +1418,42 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bus.memory.main_ram[0x200..0x204].try_into().unwrap()), 0xAABB_CCDD);
         assert_ne!(bus.arm9_iflag & (crate::interrupts::gba::DMA0 as u32), 0);
         assert_eq!(bus.arm9_dma_active_count(), 0);
+    }
+
+    #[test]
+    fn nds_bus_main_ppu_registers_round_trip() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+        let mut bus = NdsBus::new(rom, &header).expect("bus should initialize");
+
+        bus.write32(REG_DISPCNT, 0x4433_2211);
+        bus.write16(REG_DISPCNT + 0x08, 0x80C1);
+        bus.write16(REG_DISPCNT + 0x6C, 0x001F);
+
+        assert_eq!(bus.read32(REG_DISPCNT), 0x4433_2211);
+        assert_eq!(bus.ppu_main.bgcnt[0], 0x80C1);
+        assert_eq!(bus.ppu_main.master_bright, 0x001F);
+    }
+
+    #[test]
+    fn nds_bus_sub_ppu_registers_round_trip_via_arm9_view() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+        let mut bus = NdsBus::new(rom, &header).expect("bus should initialize");
+
+        {
+            let mut arm9_bus = bus.arm9_view();
+            arm9_bus.write32(REG_SUB_DISPCNT, 0x8877_6655);
+            arm9_bus.write16(REG_SUB_BG0CNT, 0x1234);
+            arm9_bus.write16(REG_SUB_MASTER_BRIGHT, 0x000F);
+
+            assert_eq!(arm9_bus.read32(REG_SUB_DISPCNT), 0x8877_6655);
+            assert_eq!(arm9_bus.read16(REG_SUB_BG0CNT), 0x1234);
+        }
+
+        assert_eq!(bus.ppu_sub.dispcnt, 0x8877_6655);
+        assert_eq!(bus.ppu_sub.bgcnt[0], 0x1234);
+        assert_eq!(bus.ppu_sub.master_bright, 0x000F);
     }
 
     #[test]
