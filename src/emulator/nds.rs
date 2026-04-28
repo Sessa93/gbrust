@@ -9,6 +9,10 @@ const NDS_SCREEN_HEIGHT: usize = NDS_HEIGHT / 2;
 const NDS_HEADER_SIZE: usize = 0x170;
 const NDS_ARM9_CYCLES_PER_FRAME: u32 = 1_117_132;
 const NDS_ARM7_CYCLES_PER_FRAME: u32 = 558_566;
+const NDS_SCREEN_PIXELS: usize = NDS_WIDTH * NDS_SCREEN_HEIGHT;
+const NDS_SCREEN_BYTES_16BPP: usize = NDS_SCREEN_PIXELS * 2;
+const MAIN_SCREEN_VRAM_OFFSET: usize = 0x00000;
+const SUB_SCREEN_VRAM_OFFSET: usize = 0x20000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NdsRomHeader {
@@ -168,8 +172,24 @@ impl NdsEmulator {
             framebuffer: vec![0xFF11161C; NDS_WIDTH * NDS_HEIGHT],
             total_frames: 0,
         };
-        emu.refresh_placeholder_framebuffer();
+        emu.refresh_framebuffer();
         Ok(emu)
+    }
+
+    fn refresh_framebuffer(&mut self) {
+        self.refresh_placeholder_framebuffer();
+        self.render_screen_preview(
+            0,
+            MAIN_SCREEN_VRAM_OFFSET,
+            self.bus.ppu_main.dispcnt,
+            self.bus.ppu_main.master_bright,
+        );
+        self.render_screen_preview(
+            NDS_SCREEN_HEIGHT,
+            SUB_SCREEN_VRAM_OFFSET,
+            self.bus.ppu_sub.dispcnt,
+            self.bus.ppu_sub.master_bright,
+        );
     }
 
     fn refresh_placeholder_framebuffer(&mut self) {
@@ -207,6 +227,41 @@ impl NdsEmulator {
                 };
             }
         }
+    }
+
+    fn render_screen_preview(&mut self, screen_y: usize, vram_offset: usize, dispcnt: u32, master_bright: u16) {
+        if !self.screen_has_preview_data(vram_offset, dispcnt, master_bright) {
+            return;
+        }
+
+        let vram = &self.bus.memory.vram;
+        let available = vram.len().saturating_sub(vram_offset);
+        let bytes_to_render = available.min(NDS_SCREEN_BYTES_16BPP);
+        let pixels_to_render = bytes_to_render / 2;
+
+        for pixel in 0..pixels_to_render {
+            let src = vram_offset + pixel * 2;
+            let color = u16::from_le_bytes([vram[src], vram[src + 1]]);
+            let lit = apply_master_brightness(color, master_bright);
+            let x = pixel % NDS_WIDTH;
+            let y = pixel / NDS_WIDTH;
+            let dst = (screen_y + y) * NDS_WIDTH + x;
+            self.framebuffer[dst] = rgb555_to_argb(lit);
+        }
+    }
+
+    fn screen_has_preview_data(&self, vram_offset: usize, dispcnt: u32, master_bright: u16) -> bool {
+        if dispcnt != 0 || master_bright != 0 {
+            return true;
+        }
+
+        let vram = &self.bus.memory.vram;
+        if vram_offset >= vram.len() {
+            return false;
+        }
+
+        let end = (vram_offset + NDS_SCREEN_BYTES_16BPP).min(vram.len());
+        vram[vram_offset..end].iter().any(|&byte| byte != 0)
     }
 
     fn run_arm9_slice(&mut self, target_cycles: u32) {
@@ -257,7 +312,7 @@ impl NdsEmulator {
         self.run_arm9_slice(NDS_ARM9_CYCLES_PER_FRAME);
         self.run_arm7_slice(NDS_ARM7_CYCLES_PER_FRAME);
         self.total_frames += 1;
-        self.refresh_placeholder_framebuffer();
+        self.refresh_framebuffer();
         &self.framebuffer
     }
 
@@ -278,9 +333,43 @@ fn argb(r: u8, g: u8, b: u8) -> u32 {
     0xFF00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
 
+fn apply_master_brightness(color: u16, master_bright: u16) -> u16 {
+    let amount = (master_bright & 0x001F).min(16);
+    match (master_bright >> 14) & 0x3 {
+        1 => adjust_rgb555(color, amount, true),
+        2 => adjust_rgb555(color, amount, false),
+        _ => color,
+    }
+}
+
+fn adjust_rgb555(color: u16, amount: u16, brighten: bool) -> u16 {
+    let adjust = |channel: u16| {
+        if brighten {
+            channel + (((31 - channel) * amount) + 7) / 16
+        } else {
+            channel.saturating_sub(((channel * amount) + 7) / 16)
+        }
+    };
+
+    let r = adjust(color & 0x1F);
+    let g = adjust((color >> 5) & 0x1F);
+    let b = adjust((color >> 10) & 0x1F);
+    r | (g << 5) | (b << 10)
+}
+
+fn rgb555_to_argb(color: u16) -> u32 {
+    let r = ((color & 0x1F) as u32) * 255 / 31;
+    let g = (((color >> 5) & 0x1F) as u32) * 255 / 31;
+    let b = (((color >> 10) & 0x1F) as u32) * 255 / 31;
+    0xFF00_0000 | (r << 16) | (g << 8) | b
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NdsEmulator, NdsRomHeader};
+    use super::{
+        apply_master_brightness, rgb555_to_argb, NdsEmulator, NdsRomHeader, MAIN_SCREEN_VRAM_OFFSET,
+        NDS_SCREEN_HEIGHT, NDS_WIDTH, SUB_SCREEN_VRAM_OFFSET,
+    };
 
     fn build_test_rom() -> Vec<u8> {
         let mut rom = vec![0u8; 0x400];
@@ -352,5 +441,39 @@ mod tests {
     fn nds_emulator_rejects_short_roms() {
         let result = NdsEmulator::new(vec![0; 0x80]);
         assert!(matches!(result, Err(ref error) if error.contains("too small")));
+    }
+
+    #[test]
+    fn nds_emulator_renders_main_and_sub_vram_previews() {
+        let rom = build_test_rom();
+        let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
+
+        emu.bus.ppu_main.dispcnt = 1;
+        emu.bus.ppu_sub.dispcnt = 1;
+        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET..MAIN_SCREEN_VRAM_OFFSET + 2]
+            .copy_from_slice(&0x001Fu16.to_le_bytes());
+        emu.bus.memory.vram[SUB_SCREEN_VRAM_OFFSET..SUB_SCREEN_VRAM_OFFSET + 2]
+            .copy_from_slice(&0x7C00u16.to_le_bytes());
+
+        emu.run_frame();
+
+        assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x001F));
+        assert_eq!(emu.framebuffer[NDS_WIDTH * NDS_SCREEN_HEIGHT], rgb555_to_argb(0x7C00));
+    }
+
+    #[test]
+    fn nds_emulator_applies_master_brightness_to_screen_preview() {
+        let rom = build_test_rom();
+        let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
+
+        emu.bus.ppu_main.dispcnt = 1;
+        emu.bus.ppu_main.master_bright = (1 << 14) | 8;
+        emu.bus.memory.vram[MAIN_SCREEN_VRAM_OFFSET..MAIN_SCREEN_VRAM_OFFSET + 2]
+            .copy_from_slice(&0x4210u16.to_le_bytes());
+
+        emu.run_frame();
+
+        let expected = rgb555_to_argb(apply_master_brightness(0x4210, emu.bus.ppu_main.master_bright));
+        assert_eq!(emu.framebuffer[0], expected);
     }
 }
