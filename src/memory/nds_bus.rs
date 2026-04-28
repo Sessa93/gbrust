@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 use crate::cpu::arm7tdmi::Arm7Bus;
+use crate::dma::GbaDma;
 use crate::emulator::nds::NdsRomHeader;
 use crate::input::{NdsInput, NdsKey};
 use crate::timer::GbaTimers;
@@ -28,6 +30,11 @@ const REG_KEYINPUT: u32 = 0x0400_0130;
 const REG_KEYINPUT_HI: u32 = REG_KEYINPUT + 1;
 const REG_EXTKEYIN: u32 = 0x0400_0136;
 const REG_EXTKEYIN_HI: u32 = REG_EXTKEYIN + 1;
+const REG_IPCSYNC: u32 = 0x0400_0180;
+const REG_IPCSYNC_HI: u32 = REG_IPCSYNC + 1;
+const REG_IPCFIFOCNT: u32 = 0x0400_0184;
+const REG_IPCFIFOCNT_HI: u32 = REG_IPCFIFOCNT + 1;
+const REG_IPCFIFOSEND: u32 = 0x0400_0188;
 const REG_IME: u32 = 0x0400_0208;
 const REG_IME_HI_1: u32 = REG_IME + 1;
 const REG_IME_HI_2: u32 = REG_IME + 2;
@@ -42,6 +49,25 @@ const REG_IF_HI_2: u32 = REG_IF + 2;
 const REG_IF_HI_3: u32 = REG_IF + 3;
 const REG_POSTFLG: u32 = 0x0400_0300;
 const REG_HALTCNT: u32 = 0x0400_0301;
+const IPC_FIFO_CAPACITY: usize = 16;
+
+#[derive(Clone, Copy)]
+enum NdsCpu {
+    Arm7,
+    Arm9,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct NdsIpcState {
+    pub arm7_sync_out: u8,
+    pub arm9_sync_out: u8,
+    pub arm7_fifo_enabled: bool,
+    pub arm9_fifo_enabled: bool,
+    pub arm7_recv_irq_enabled: bool,
+    pub arm9_recv_irq_enabled: bool,
+    pub arm7_recv_fifo: VecDeque<u32>,
+    pub arm9_recv_fifo: VecDeque<u32>,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct NdsMemory {
@@ -134,6 +160,9 @@ pub struct NdsBus {
     pub io: Vec<u8>,
     pub timers: GbaTimers,
     pub arm9_timers: GbaTimers,
+    pub dma: GbaDma,
+    pub arm9_dma: GbaDma,
+    pub ipc: NdsIpcState,
     pub bios7: Vec<u8>,
     pub bios9: Vec<u8>,
     pub cartridge_rom: Vec<u8>,
@@ -164,6 +193,13 @@ impl NdsBus {
             io: vec![0; IO_SIZE],
             timers: GbaTimers::new(),
             arm9_timers: GbaTimers::new(),
+            dma: GbaDma::new(),
+            arm9_dma: GbaDma::new(),
+            ipc: NdsIpcState {
+                arm7_fifo_enabled: true,
+                arm9_fifo_enabled: true,
+                ..NdsIpcState::default()
+            },
             bios7: Self::generate_hle_bios7(),
             bios9: Self::generate_hle_bios9(),
             cartridge_rom: rom,
@@ -201,6 +237,7 @@ impl NdsBus {
     pub fn tick(&mut self, cycles: u32) {
         let (timer_irqs, _) = self.timers.tick(cycles);
         self.iflag |= timer_irqs as u32;
+        self.process_dma(NdsCpu::Arm7);
         self.cycles += cycles as u64;
         if self.halt && self.check_irq() {
             self.halt = false;
@@ -210,6 +247,7 @@ impl NdsBus {
     pub fn tick_arm9(&mut self, cycles: u32) {
         let (timer_irqs, _) = self.arm9_timers.tick(cycles);
         self.arm9_iflag |= timer_irqs as u32;
+        self.process_dma(NdsCpu::Arm9);
         self.arm9_cycles += cycles as u64;
         if self.arm9_halt && self.arm9_check_irq() {
             self.arm9_halt = false;
@@ -236,13 +274,320 @@ impl NdsBus {
         }
     }
 
+    fn read_ipcsync(&self, cpu: NdsCpu) -> u16 {
+        let (local, remote) = match cpu {
+            NdsCpu::Arm7 => (self.ipc.arm7_sync_out, self.ipc.arm9_sync_out),
+            NdsCpu::Arm9 => (self.ipc.arm9_sync_out, self.ipc.arm7_sync_out),
+        };
+        (local as u16 & 0x000F) | (((remote as u16) & 0x000F) << 8)
+    }
+
+    fn write_ipcsync(&mut self, cpu: NdsCpu, value: u16) {
+        let nibble = (value & 0x000F) as u8;
+        match cpu {
+            NdsCpu::Arm7 => self.ipc.arm7_sync_out = nibble,
+            NdsCpu::Arm9 => self.ipc.arm9_sync_out = nibble,
+        }
+    }
+
+    fn recv_fifo(&self, cpu: NdsCpu) -> &VecDeque<u32> {
+        match cpu {
+            NdsCpu::Arm7 => &self.ipc.arm7_recv_fifo,
+            NdsCpu::Arm9 => &self.ipc.arm9_recv_fifo,
+        }
+    }
+
+    fn recv_fifo_mut(&mut self, cpu: NdsCpu) -> &mut VecDeque<u32> {
+        match cpu {
+            NdsCpu::Arm7 => &mut self.ipc.arm7_recv_fifo,
+            NdsCpu::Arm9 => &mut self.ipc.arm9_recv_fifo,
+        }
+    }
+
+    fn peek_ipc_fifo(&self, cpu: NdsCpu) -> u32 {
+        self.recv_fifo(cpu).front().copied().unwrap_or(0)
+    }
+
+    fn pop_ipc_fifo(&mut self, cpu: NdsCpu) -> u32 {
+        self.recv_fifo_mut(cpu).pop_front().unwrap_or(0)
+    }
+
+    fn fifo_enabled(&self, cpu: NdsCpu) -> bool {
+        match cpu {
+            NdsCpu::Arm7 => self.ipc.arm7_fifo_enabled,
+            NdsCpu::Arm9 => self.ipc.arm9_fifo_enabled,
+        }
+    }
+
+    fn write_ipcfifocnt(&mut self, cpu: NdsCpu, value: u16) {
+        let enable = value & 0x8000 != 0;
+        let recv_irq_enabled = value & 0x0400 != 0;
+        let clear_recv = value & 0x0008 != 0;
+
+        match cpu {
+            NdsCpu::Arm7 => {
+                self.ipc.arm7_fifo_enabled = enable;
+                self.ipc.arm7_recv_irq_enabled = recv_irq_enabled;
+                if clear_recv {
+                    self.ipc.arm7_recv_fifo.clear();
+                }
+            }
+            NdsCpu::Arm9 => {
+                self.ipc.arm9_fifo_enabled = enable;
+                self.ipc.arm9_recv_irq_enabled = recv_irq_enabled;
+                if clear_recv {
+                    self.ipc.arm9_recv_fifo.clear();
+                }
+            }
+        }
+    }
+
+    fn read_ipcfifocnt(&self, cpu: NdsCpu) -> u16 {
+        let recv_fifo = self.recv_fifo(cpu);
+        let send_fifo = self.recv_fifo(match cpu {
+            NdsCpu::Arm7 => NdsCpu::Arm9,
+            NdsCpu::Arm9 => NdsCpu::Arm7,
+        });
+
+        let mut value = 0u16;
+        if send_fifo.is_empty() {
+            value |= 1 << 0;
+        }
+        if send_fifo.len() >= IPC_FIFO_CAPACITY {
+            value |= 1 << 1;
+        }
+        if recv_fifo.is_empty() {
+            value |= 1 << 8;
+        }
+        if recv_fifo.len() >= IPC_FIFO_CAPACITY {
+            value |= 1 << 9;
+        }
+        if match cpu {
+            NdsCpu::Arm7 => self.ipc.arm7_recv_irq_enabled,
+            NdsCpu::Arm9 => self.ipc.arm9_recv_irq_enabled,
+        } {
+            value |= 1 << 10;
+        }
+        if self.fifo_enabled(cpu) {
+            value |= 1 << 15;
+        }
+
+        value
+    }
+
+    fn send_ipc_word(&mut self, cpu: NdsCpu, value: u32) {
+        let peer = match cpu {
+            NdsCpu::Arm7 => NdsCpu::Arm9,
+            NdsCpu::Arm9 => NdsCpu::Arm7,
+        };
+
+        if !self.fifo_enabled(cpu) || !self.fifo_enabled(peer) {
+            return;
+        }
+
+        let recv_fifo = self.recv_fifo_mut(peer);
+        if recv_fifo.len() < IPC_FIFO_CAPACITY {
+            recv_fifo.push_back(value);
+        }
+    }
+
+    pub fn arm7_dma_active_count(&self) -> usize {
+        self.dma.channels.iter().filter(|channel| channel.active || channel.enabled).count()
+    }
+
+    pub fn arm9_dma_active_count(&self) -> usize {
+        self.arm9_dma
+            .channels
+            .iter()
+            .filter(|channel| channel.active || channel.enabled)
+            .count()
+    }
+
+    pub fn arm7_ipc_depth(&self) -> usize {
+        self.ipc.arm7_recv_fifo.len()
+    }
+
+    pub fn arm9_ipc_depth(&self) -> usize {
+        self.ipc.arm9_recv_fifo.len()
+    }
+
+    fn process_dma(&mut self, cpu: NdsCpu) {
+        for channel_index in 0..4usize {
+            let channel = match cpu {
+                NdsCpu::Arm7 => self.dma.channels[channel_index].clone(),
+                NdsCpu::Arm9 => self.arm9_dma.channels[channel_index].clone(),
+            };
+
+            if !channel.active {
+                continue;
+            }
+
+            let count = match channel.count as u32 {
+                0 => 0x1_0000,
+                value => value,
+            };
+            let word_size = if channel.word_size { 4u32 } else { 2u32 };
+            let src_inc = match channel.src_control {
+                0 => word_size as i32,
+                1 => -(word_size as i32),
+                2 => 0,
+                _ => word_size as i32,
+            };
+            let dst_inc = match channel.dst_control {
+                0 | 3 => word_size as i32,
+                1 => -(word_size as i32),
+                2 => 0,
+                _ => word_size as i32,
+            };
+
+            let mut src = channel.src_addr;
+            let mut dst = channel.dst_addr;
+
+            for _ in 0..count {
+                if channel.word_size {
+                    let value = self.dma_read32(cpu, src);
+                    self.dma_write32(cpu, dst, value);
+                } else {
+                    let value = self.dma_read16(cpu, src);
+                    self.dma_write16(cpu, dst, value);
+                }
+
+                src = (src as i32).wrapping_add(src_inc) as u32;
+                dst = (dst as i32).wrapping_add(dst_inc) as u32;
+            }
+
+            let active_channel = match cpu {
+                NdsCpu::Arm7 => &mut self.dma.channels[channel_index],
+                NdsCpu::Arm9 => &mut self.arm9_dma.channels[channel_index],
+            };
+
+            active_channel.src_addr = src;
+            if active_channel.dst_control != 3 {
+                active_channel.dst_addr = dst;
+            }
+
+            if active_channel.repeat && active_channel.timing != 0 {
+                active_channel.active = false;
+                if active_channel.dst_control == 3 {
+                    active_channel.dst_addr = active_channel.dst_latch;
+                }
+            } else {
+                active_channel.active = false;
+                active_channel.enabled = false;
+                active_channel.control &= !0x8000;
+            }
+
+            if active_channel.irq {
+                let irq_bit = (crate::interrupts::gba::DMA0 as u32) << channel_index;
+                match cpu {
+                    NdsCpu::Arm7 => self.iflag |= irq_bit,
+                    NdsCpu::Arm9 => self.arm9_iflag |= irq_bit,
+                }
+            }
+        }
+    }
+
+    fn dma_read8(&self, cpu: NdsCpu, addr: u32) -> u8 {
+        match cpu {
+            NdsCpu::Arm7 => match addr {
+                0x0000_0000..=0x0000_3FFF => Self::read_region(&self.bios7, 0x0000_0000, addr),
+                MAIN_RAM_BASE..=0x023F_FFFF => Self::read_region(&self.memory.main_ram, MAIN_RAM_BASE, addr),
+                SHARED_WRAM_BASE..=0x0300_7FFF => Self::read_region(&self.memory.shared_wram, SHARED_WRAM_BASE, addr),
+                ARM7_WRAM_BASE..=0x0380_FFFF => Self::read_region(&self.memory.arm7_wram, ARM7_WRAM_BASE, addr),
+                IO_BASE..=0x0400_0FFF => self.read_io_byte(addr),
+                PALETTE_BASE..=0x0500_0FFF => Self::read_region(&self.memory.palette, PALETTE_BASE, addr),
+                VRAM_BASE..=0x060A_3FFF => Self::read_region(&self.memory.vram, VRAM_BASE, addr),
+                OAM_BASE..=0x0700_03FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
+                CART_BASE..=0x09FF_FFFF => {
+                    let offset = (addr - CART_BASE) as usize;
+                    self.cartridge_rom.get(offset).copied().unwrap_or(0xFF)
+                }
+                _ => 0,
+            },
+            NdsCpu::Arm9 => match addr {
+                MAIN_RAM_BASE..=0x023F_FFFF => Self::read_region(&self.memory.main_ram, MAIN_RAM_BASE, addr),
+                SHARED_WRAM_BASE..=0x0300_7FFF => Self::read_region(&self.memory.shared_wram, SHARED_WRAM_BASE, addr),
+                IO_BASE..=0x0400_0FFF => self.read_arm9_io_byte(addr),
+                PALETTE_BASE..=0x0500_0FFF => Self::read_region(&self.memory.palette, PALETTE_BASE, addr),
+                VRAM_BASE..=0x060A_3FFF => Self::read_region(&self.memory.vram, VRAM_BASE, addr),
+                OAM_BASE..=0x0700_03FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
+                CART_BASE..=0x09FF_FFFF => {
+                    let offset = (addr - CART_BASE) as usize;
+                    self.cartridge_rom.get(offset).copied().unwrap_or(0xFF)
+                }
+                ARM9_BIOS_BASE..=0xFFFF_7FFF => Self::read_region(&self.bios9, ARM9_BIOS_BASE, addr),
+                _ => 0,
+            },
+        }
+    }
+
+    fn dma_read16(&self, cpu: NdsCpu, addr: u32) -> u16 {
+        u16::from_le_bytes([self.dma_read8(cpu, addr), self.dma_read8(cpu, addr.wrapping_add(1))])
+    }
+
+    fn dma_read32(&self, cpu: NdsCpu, addr: u32) -> u32 {
+        u32::from_le_bytes([
+            self.dma_read8(cpu, addr),
+            self.dma_read8(cpu, addr.wrapping_add(1)),
+            self.dma_read8(cpu, addr.wrapping_add(2)),
+            self.dma_read8(cpu, addr.wrapping_add(3)),
+        ])
+    }
+
+    fn dma_write8(&mut self, cpu: NdsCpu, addr: u32, value: u8) {
+        match cpu {
+            NdsCpu::Arm7 => match addr {
+                MAIN_RAM_BASE..=0x023F_FFFF => Self::write_region(&mut self.memory.main_ram, MAIN_RAM_BASE, addr, value),
+                SHARED_WRAM_BASE..=0x0300_7FFF => Self::write_region(&mut self.memory.shared_wram, SHARED_WRAM_BASE, addr, value),
+                ARM7_WRAM_BASE..=0x0380_FFFF => Self::write_region(&mut self.memory.arm7_wram, ARM7_WRAM_BASE, addr, value),
+                IO_BASE..=0x0400_0FFF => self.write_io_byte(addr, value),
+                PALETTE_BASE..=0x0500_0FFF => Self::write_region(&mut self.memory.palette, PALETTE_BASE, addr, value),
+                VRAM_BASE..=0x060A_3FFF => Self::write_region(&mut self.memory.vram, VRAM_BASE, addr, value),
+                OAM_BASE..=0x0700_03FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, value),
+                _ => {}
+            },
+            NdsCpu::Arm9 => match addr {
+                MAIN_RAM_BASE..=0x023F_FFFF => Self::write_region(&mut self.memory.main_ram, MAIN_RAM_BASE, addr, value),
+                SHARED_WRAM_BASE..=0x0300_7FFF => Self::write_region(&mut self.memory.shared_wram, SHARED_WRAM_BASE, addr, value),
+                IO_BASE..=0x0400_0FFF => self.write_arm9_io_byte(addr, value),
+                PALETTE_BASE..=0x0500_0FFF => Self::write_region(&mut self.memory.palette, PALETTE_BASE, addr, value),
+                VRAM_BASE..=0x060A_3FFF => Self::write_region(&mut self.memory.vram, VRAM_BASE, addr, value),
+                OAM_BASE..=0x0700_03FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, value),
+                _ => {}
+            },
+        }
+    }
+
+    fn dma_write16(&mut self, cpu: NdsCpu, addr: u32, value: u16) {
+        let bytes = value.to_le_bytes();
+        self.dma_write8(cpu, addr, bytes[0]);
+        self.dma_write8(cpu, addr.wrapping_add(1), bytes[1]);
+    }
+
+    fn dma_write32(&mut self, cpu: NdsCpu, addr: u32, value: u32) {
+        let bytes = value.to_le_bytes();
+        self.dma_write8(cpu, addr, bytes[0]);
+        self.dma_write8(cpu, addr.wrapping_add(1), bytes[1]);
+        self.dma_write8(cpu, addr.wrapping_add(2), bytes[2]);
+        self.dma_write8(cpu, addr.wrapping_add(3), bytes[3]);
+    }
+
     fn read_io_byte(&self, addr: u32) -> u8 {
         match addr {
+            0x0400_00B0..=0x0400_00DF => self.dma.read(addr - IO_BASE),
             0x0400_0100..=0x0400_010F => self.timers.read(addr - IO_BASE),
             REG_KEYINPUT => self.input.read_keyinput() as u8,
             REG_KEYINPUT_HI => (self.input.read_keyinput() >> 8) as u8,
             REG_EXTKEYIN => self.input.read_extkeyin() as u8,
             REG_EXTKEYIN_HI => (self.input.read_extkeyin() >> 8) as u8,
+            REG_IPCSYNC => self.read_ipcsync(NdsCpu::Arm7) as u8,
+            REG_IPCSYNC_HI => (self.read_ipcsync(NdsCpu::Arm7) >> 8) as u8,
+            REG_IPCFIFOCNT => self.read_ipcfifocnt(NdsCpu::Arm7) as u8,
+            REG_IPCFIFOCNT_HI => (self.read_ipcfifocnt(NdsCpu::Arm7) >> 8) as u8,
+            0x0400_0188..=0x0400_018B => {
+                let shift = ((addr - REG_IPCFIFOSEND) * 8) as u32;
+                (self.peek_ipc_fifo(NdsCpu::Arm7) >> shift) as u8
+            }
             REG_IME => self.ime as u8,
             REG_IME_HI_1 | REG_IME_HI_2 | REG_IME_HI_3 => 0,
             REG_IE => self.ie as u8,
@@ -264,7 +609,16 @@ impl NdsBus {
 
     fn read_arm9_io_byte(&self, addr: u32) -> u8 {
         match addr {
+            0x0400_00B0..=0x0400_00DF => self.arm9_dma.read(addr - IO_BASE),
             0x0400_0100..=0x0400_010F => self.arm9_timers.read(addr - IO_BASE),
+            REG_IPCSYNC => self.read_ipcsync(NdsCpu::Arm9) as u8,
+            REG_IPCSYNC_HI => (self.read_ipcsync(NdsCpu::Arm9) >> 8) as u8,
+            REG_IPCFIFOCNT => self.read_ipcfifocnt(NdsCpu::Arm9) as u8,
+            REG_IPCFIFOCNT_HI => (self.read_ipcfifocnt(NdsCpu::Arm9) >> 8) as u8,
+            0x0400_0188..=0x0400_018B => {
+                let shift = ((addr - REG_IPCFIFOSEND) * 8) as u32;
+                (self.peek_ipc_fifo(NdsCpu::Arm9) >> shift) as u8
+            }
             REG_IME => self.arm9_ime as u8,
             REG_IME_HI_1 | REG_IME_HI_2 | REG_IME_HI_3 => 0,
             REG_IE => self.arm9_ie as u8,
@@ -286,7 +640,12 @@ impl NdsBus {
 
     fn write_io_byte(&mut self, addr: u32, value: u8) {
         match addr {
+            0x0400_00B0..=0x0400_00DF => self.dma.write(addr - IO_BASE, value),
             0x0400_0100..=0x0400_010F => self.timers.write(addr - IO_BASE, value),
+            REG_IPCSYNC => self.write_ipcsync(NdsCpu::Arm7, value as u16),
+            REG_IPCSYNC_HI => self.write_ipcsync(NdsCpu::Arm7, (value as u16) << 8),
+            REG_IPCFIFOCNT => self.write_ipcfifocnt(NdsCpu::Arm7, value as u16),
+            REG_IPCFIFOCNT_HI => self.write_ipcfifocnt(NdsCpu::Arm7, (value as u16) << 8),
             REG_IME => self.ime = value & 0x01 != 0,
             REG_IE => self.ie = (self.ie & !0x0000_00FF) | value as u32,
             REG_IE_HI_1 => self.ie = (self.ie & !0x0000_FF00) | ((value as u32) << 8),
@@ -307,7 +666,12 @@ impl NdsBus {
 
     fn write_arm9_io_byte(&mut self, addr: u32, value: u8) {
         match addr {
+            0x0400_00B0..=0x0400_00DF => self.arm9_dma.write(addr - IO_BASE, value),
             0x0400_0100..=0x0400_010F => self.arm9_timers.write(addr - IO_BASE, value),
+            REG_IPCSYNC => self.write_ipcsync(NdsCpu::Arm9, value as u16),
+            REG_IPCSYNC_HI => self.write_ipcsync(NdsCpu::Arm9, (value as u16) << 8),
+            REG_IPCFIFOCNT => self.write_ipcfifocnt(NdsCpu::Arm9, value as u16),
+            REG_IPCFIFOCNT_HI => self.write_ipcfifocnt(NdsCpu::Arm9, (value as u16) << 8),
             REG_IME => self.arm9_ime = value & 0x01 != 0,
             REG_IE => self.arm9_ie = (self.arm9_ie & !0x0000_00FF) | value as u32,
             REG_IE_HI_1 => self.arm9_ie = (self.arm9_ie & !0x0000_FF00) | ((value as u32) << 8),
@@ -364,6 +728,10 @@ impl Arm7Bus for NdsArm9Bus<'_> {
     }
 
     fn read32(&mut self, addr: u32) -> u32 {
+        if (REG_IPCFIFOSEND..=REG_IPCFIFOSEND + 3).contains(&addr) {
+            return self.bus.pop_ipc_fifo(NdsCpu::Arm9);
+        }
+
         let value = u32::from_le_bytes([
             self.read8(addr),
             self.read8(addr.wrapping_add(1)),
@@ -399,6 +767,11 @@ impl Arm7Bus for NdsArm9Bus<'_> {
     }
 
     fn write32(&mut self, addr: u32, val: u32) {
+        if addr == REG_IPCFIFOSEND {
+            self.bus.send_ipc_word(NdsCpu::Arm9, val);
+            return;
+        }
+
         let bytes = val.to_le_bytes();
         self.write8(addr, bytes[0]);
         self.write8(addr.wrapping_add(1), bytes[1]);
@@ -433,6 +806,10 @@ impl Arm7Bus for NdsBus {
     }
 
     fn read32(&mut self, addr: u32) -> u32 {
+        if (REG_IPCFIFOSEND..=REG_IPCFIFOSEND + 3).contains(&addr) {
+            return self.pop_ipc_fifo(NdsCpu::Arm7);
+        }
+
         let value = u32::from_le_bytes([
             self.read8(addr),
             self.read8(addr.wrapping_add(1)),
@@ -467,6 +844,11 @@ impl Arm7Bus for NdsBus {
     }
 
     fn write32(&mut self, addr: u32, val: u32) {
+        if addr == REG_IPCFIFOSEND {
+            self.send_ipc_word(NdsCpu::Arm7, val);
+            return;
+        }
+
         let bytes = val.to_le_bytes();
         self.write8(addr, bytes[0]);
         self.write8(addr.wrapping_add(1), bytes[1]);
@@ -477,11 +859,15 @@ impl Arm7Bus for NdsBus {
 
 #[cfg(test)]
 mod tests {
-    use super::{NdsBus, REG_EXTKEYIN, REG_KEYINPUT};
+    use super::{NdsBus, REG_EXTKEYIN, REG_IPCFIFOCNT, REG_IPCFIFOSEND, REG_KEYINPUT};
     use crate::cpu::arm7tdmi::{Arm7Bus, Arm7Tdmi};
     use crate::emulator::nds::NdsRomHeader;
     use crate::input::NdsKey;
 
+    const REG_DMA0SAD: u32 = 0x0400_00B0;
+    const REG_DMA0DAD: u32 = 0x0400_00B4;
+    const REG_DMA0CNT_L: u32 = 0x0400_00B8;
+    const REG_DMA0CNT_H: u32 = 0x0400_00BA;
     const REG_TM0CNT_L: u32 = 0x0400_0100;
     const REG_TM0CNT_H: u32 = 0x0400_0102;
 
@@ -572,5 +958,49 @@ mod tests {
 
         assert_ne!(bus.arm9_iflag & (1 << 3), 0);
         assert!(bus.arm9_check_irq());
+    }
+
+    #[test]
+    fn nds_bus_ipc_fifo_moves_words_between_cpus() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+        let mut bus = NdsBus::new(rom, &header).expect("bus should initialize");
+
+        bus.write16(REG_IPCFIFOCNT, 0x8000);
+        {
+            let mut arm9_bus = bus.arm9_view();
+            arm9_bus.write16(REG_IPCFIFOCNT, 0x8000);
+        }
+
+        bus.write32(REG_IPCFIFOSEND, 0x1234_5678);
+
+        {
+            let mut arm9_bus = bus.arm9_view();
+            assert_eq!(arm9_bus.read32(REG_IPCFIFOSEND), 0x1234_5678);
+            assert_ne!(arm9_bus.read16(REG_IPCFIFOCNT) & (1 << 8), 0);
+        }
+    }
+
+    #[test]
+    fn nds_bus_arm9_dma_copies_words_and_raises_irq() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+        let mut bus = NdsBus::new(rom, &header).expect("bus should initialize");
+
+        bus.memory.main_ram[0x100..0x104].copy_from_slice(&0xAABB_CCDDu32.to_le_bytes());
+
+        {
+            let mut arm9_bus = bus.arm9_view();
+            arm9_bus.write32(REG_DMA0SAD, 0x0200_0100);
+            arm9_bus.write32(REG_DMA0DAD, 0x0200_0200);
+            arm9_bus.write16(REG_DMA0CNT_L, 1);
+            arm9_bus.write16(REG_DMA0CNT_H, 0xC400);
+        }
+
+        bus.tick_arm9(1);
+
+        assert_eq!(u32::from_le_bytes(bus.memory.main_ram[0x200..0x204].try_into().unwrap()), 0xAABB_CCDD);
+        assert_ne!(bus.arm9_iflag & (crate::interrupts::gba::DMA0 as u32), 0);
+        assert_eq!(bus.arm9_dma_active_count(), 0);
     }
 }

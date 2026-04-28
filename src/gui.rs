@@ -950,6 +950,13 @@ impl EmuApp {
             emu.bus.halt,
             emu.bus.cycles,
         ));
+        ui.label(format!(
+            "IPC queues ARM7={} ARM9={} | DMA active ARM7={} ARM9={}",
+            emu.bus.arm7_ipc_depth(),
+            emu.bus.arm9_ipc_depth(),
+            emu.bus.arm7_dma_active_count(),
+            emu.bus.arm9_dma_active_count(),
+        ));
 
         ui.separator();
         ui.label(RichText::new("ARM9").strong());
