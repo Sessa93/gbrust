@@ -29,6 +29,10 @@ const MAIN_BG_VRAM_BASE: u32 = 0x0600_0000;
 const MAIN_BG_VRAM_SIZE: usize = 0x0008_0000;
 const SUB_BG_VRAM_BASE: u32 = 0x0620_0000;
 const SUB_BG_VRAM_SIZE: usize = 0x0002_0000;
+const MAIN_OBJ_VRAM_BASE: u32 = 0x0640_0000;
+const MAIN_OBJ_VRAM_SIZE: usize = 0x0004_0000;
+const SUB_OBJ_VRAM_BASE: u32 = 0x0660_0000;
+const SUB_OBJ_VRAM_SIZE: usize = 0x0002_0000;
 const VRAMCNT_ENABLE: u8 = 0x80;
 const VRAM_BANK_A: usize = 0;
 const VRAM_BANK_B: usize = 1;
@@ -96,6 +100,7 @@ const REG_HALTCNT: u32 = 0x0400_0301;
 const IPC_FIFO_CAPACITY: usize = 16;
 
 const SMALL_MAIN_BG_OFFSETS: [usize; 4] = [0x00000, 0x04000, 0x10000, 0x14000];
+const SMALL_MAIN_OBJ_OFFSETS: [usize; 4] = [0x00000, 0x04000, 0x10000, 0x14000];
 
 #[derive(Clone, Copy)]
 enum NdsCpu {
@@ -580,6 +585,14 @@ impl NdsBus {
         self.copy_bg_vram_window(true)
     }
 
+    pub fn mapped_main_obj_vram(&self) -> Vec<u8> {
+        self.copy_obj_vram_window(false)
+    }
+
+    pub fn mapped_sub_obj_vram(&self) -> Vec<u8> {
+        self.copy_obj_vram_window(true)
+    }
+
     fn read_ppu_byte(&self, addr: u32) -> Option<u8> {
         match addr {
             PPU_MAIN_BASE..=PPU_MAIN_END => {
@@ -619,6 +632,35 @@ impl NdsBus {
                     window[mapping.window_offset..dst_end]
                         .copy_from_slice(&self.memory.vram[mapping.physical_offset..src_end]);
                 }
+            }
+        }
+
+        window
+    }
+
+    fn copy_obj_vram_window(&self, sub: bool) -> Vec<u8> {
+        let mut window = vec![0; if sub { SUB_OBJ_VRAM_SIZE } else { MAIN_OBJ_VRAM_SIZE }];
+        let bank_order: &[usize] = if sub {
+            &[VRAM_BANK_D, VRAM_BANK_I]
+        } else {
+            &[
+                VRAM_BANK_A,
+                VRAM_BANK_B,
+                VRAM_BANK_E,
+                VRAM_BANK_F,
+                VRAM_BANK_G,
+            ]
+        };
+
+        for &bank in bank_order {
+            let Some(mapping) = self.vram_bank_obj_mapping(bank, sub) else {
+                continue;
+            };
+            let src_end = mapping.physical_offset + mapping.len;
+            let dst_end = mapping.window_offset + mapping.len;
+            if src_end <= self.memory.vram.len() && dst_end <= window.len() {
+                window[mapping.window_offset..dst_end]
+                    .copy_from_slice(&self.memory.vram[mapping.physical_offset..src_end]);
             }
         }
 
@@ -964,7 +1006,7 @@ impl NdsBus {
                 IO_BASE..=IO_END => self.read_io_byte(addr),
                 PALETTE_BASE..=0x0500_0FFF => Self::read_region(&self.memory.palette, PALETTE_BASE, addr),
                 _ if Self::is_vram_addr(addr) => self.read_vram_byte(cpu, addr),
-                OAM_BASE..=0x0700_03FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
+                OAM_BASE..=0x0700_07FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
                 CART_BASE..=0x09FF_FFFF => {
                     let offset = (addr - CART_BASE) as usize;
                     self.cartridge_rom.get(offset).copied().unwrap_or(0xFF)
@@ -977,7 +1019,7 @@ impl NdsBus {
                 IO_BASE..=IO_END => self.read_arm9_io_byte(addr),
                 PALETTE_BASE..=0x0500_0FFF => Self::read_region(&self.memory.palette, PALETTE_BASE, addr),
                 _ if Self::is_vram_addr(addr) => self.read_vram_byte(cpu, addr),
-                OAM_BASE..=0x0700_03FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
+                OAM_BASE..=0x0700_07FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
                 CART_BASE..=0x09FF_FFFF => {
                     let offset = (addr - CART_BASE) as usize;
                     self.cartridge_rom.get(offset).copied().unwrap_or(0xFF)
@@ -1010,7 +1052,7 @@ impl NdsBus {
                 IO_BASE..=IO_END => self.write_io_byte(addr, value),
                 PALETTE_BASE..=0x0500_0FFF => Self::write_region(&mut self.memory.palette, PALETTE_BASE, addr, value),
                 _ if Self::is_vram_addr(addr) => self.write_vram_byte(cpu, addr, value),
-                OAM_BASE..=0x0700_03FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, value),
+                OAM_BASE..=0x0700_07FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, value),
                 _ => {}
             },
             NdsCpu::Arm9 => match addr {
@@ -1019,7 +1061,7 @@ impl NdsBus {
                 IO_BASE..=IO_END => self.write_arm9_io_byte(addr, value),
                 PALETTE_BASE..=0x0500_0FFF => Self::write_region(&mut self.memory.palette, PALETTE_BASE, addr, value),
                 _ if Self::is_vram_addr(addr) => self.write_vram_byte(cpu, addr, value),
-                OAM_BASE..=0x0700_03FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, value),
+                OAM_BASE..=0x0700_07FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, value),
                 _ => {}
             },
         }
@@ -1028,6 +1070,8 @@ impl NdsBus {
     fn is_vram_addr(addr: u32) -> bool {
         (MAIN_BG_VRAM_BASE..MAIN_BG_VRAM_BASE + MAIN_BG_VRAM_SIZE as u32).contains(&addr)
             || (SUB_BG_VRAM_BASE..SUB_BG_VRAM_BASE + SUB_BG_VRAM_SIZE as u32).contains(&addr)
+            || (MAIN_OBJ_VRAM_BASE..MAIN_OBJ_VRAM_BASE + MAIN_OBJ_VRAM_SIZE as u32).contains(&addr)
+            || (SUB_OBJ_VRAM_BASE..SUB_OBJ_VRAM_BASE + SUB_OBJ_VRAM_SIZE as u32).contains(&addr)
     }
 
     fn read_vram_byte(&self, cpu: NdsCpu, addr: u32) -> u8 {
@@ -1072,6 +1116,8 @@ impl NdsBus {
             ],
             false,
         )
+        .or_else(|| self.resolve_obj_bank_window(addr, false))
+        .or_else(|| self.resolve_obj_bank_window(addr, true))
     }
 
     fn resolve_vram_bank_window(
@@ -1162,6 +1208,75 @@ impl NdsBus {
                 window_offset: (((control >> 3) & 0x3) as usize) * 0x20000,
                 physical_offset: VRAM_BANK_OFFSETS[bank],
                 len: VRAM_BANK_SIZES[bank],
+            }),
+            _ => None,
+        }
+    }
+
+    fn resolve_obj_bank_window(&self, addr: u32, sub: bool) -> Option<usize> {
+        let banks: &[usize] = if sub {
+            &[VRAM_BANK_I, VRAM_BANK_D]
+        } else {
+            &[
+                VRAM_BANK_F,
+                VRAM_BANK_G,
+                VRAM_BANK_E,
+                VRAM_BANK_A,
+                VRAM_BANK_B,
+            ]
+        };
+
+        for &bank in banks {
+            let Some(mapping) = self.vram_bank_obj_mapping(bank, sub) else {
+                continue;
+            };
+            let base = if sub { SUB_OBJ_VRAM_BASE } else { MAIN_OBJ_VRAM_BASE };
+            let start = base + mapping.window_offset as u32;
+            let end = start + mapping.len as u32;
+            if (start..end).contains(&addr) {
+                return Some(mapping.physical_offset + (addr - start) as usize);
+            }
+        }
+
+        None
+    }
+
+    fn vram_bank_obj_mapping(&self, bank: usize, sub: bool) -> Option<NdsVramMapping> {
+        let control = *self.vramcnt.get(bank)?;
+        if control & VRAMCNT_ENABLE == 0 {
+            return None;
+        }
+
+        let mst = control & 0x7;
+        let offset = ((control >> 3) & 0x3) as usize;
+        let physical_offset = *VRAM_BANK_OFFSETS.get(bank)?;
+        let len = *VRAM_BANK_SIZES.get(bank)?;
+
+        match (bank, sub, mst) {
+            (VRAM_BANK_A | VRAM_BANK_B, false, 2) => Some(NdsVramMapping {
+                window_offset: offset * 0x20000,
+                physical_offset,
+                len,
+            }),
+            (VRAM_BANK_E, false, 2) => Some(NdsVramMapping {
+                window_offset: 0,
+                physical_offset,
+                len,
+            }),
+            (VRAM_BANK_F | VRAM_BANK_G, false, 2) => Some(NdsVramMapping {
+                window_offset: SMALL_MAIN_OBJ_OFFSETS[offset],
+                physical_offset,
+                len,
+            }),
+            (VRAM_BANK_D, true, 4) => Some(NdsVramMapping {
+                window_offset: 0,
+                physical_offset,
+                len,
+            }),
+            (VRAM_BANK_I, true, 2) => Some(NdsVramMapping {
+                window_offset: 0,
+                physical_offset,
+                len,
             }),
             _ => None,
         }
@@ -1369,7 +1484,7 @@ impl Arm7Bus for NdsArm9Bus<'_> {
             IO_BASE..=IO_END => self.bus.read_arm9_io_byte(addr),
             PALETTE_BASE..=0x0500_0FFF => NdsBus::read_region(&self.bus.memory.palette, PALETTE_BASE, addr),
             _ if NdsBus::is_vram_addr(addr) => self.bus.read_vram_byte(NdsCpu::Arm9, addr),
-            OAM_BASE..=0x0700_03FF => NdsBus::read_region(&self.bus.memory.oam, OAM_BASE, addr),
+            OAM_BASE..=0x0700_07FF => NdsBus::read_region(&self.bus.memory.oam, OAM_BASE, addr),
             CART_BASE..=0x09FF_FFFF => {
                 let offset = (addr - CART_BASE) as usize;
                 self.bus.cartridge_rom.get(offset).copied().unwrap_or(0xFF)
@@ -1411,7 +1526,7 @@ impl Arm7Bus for NdsArm9Bus<'_> {
                 NdsBus::write_region(&mut self.bus.memory.palette, PALETTE_BASE, addr, val)
             }
             _ if NdsBus::is_vram_addr(addr) => self.bus.write_vram_byte(NdsCpu::Arm9, addr, val),
-            OAM_BASE..=0x0700_03FF => NdsBus::write_region(&mut self.bus.memory.oam, OAM_BASE, addr, val),
+            OAM_BASE..=0x0700_07FF => NdsBus::write_region(&mut self.bus.memory.oam, OAM_BASE, addr, val),
             _ => {}
         }
     }
@@ -1448,7 +1563,7 @@ impl Arm7Bus for NdsBus {
             IO_BASE..=IO_END => self.read_io_byte(addr),
             PALETTE_BASE..=0x0500_0FFF => Self::read_region(&self.memory.palette, PALETTE_BASE, addr),
             VRAM_BASE..=0x060A_3FFF => Self::read_region(&self.memory.vram, VRAM_BASE, addr),
-            OAM_BASE..=0x0700_03FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
+            OAM_BASE..=0x0700_07FF => Self::read_region(&self.memory.oam, OAM_BASE, addr),
             CART_BASE..=0x09FF_FFFF => {
                 let offset = (addr - CART_BASE) as usize;
                 self.cartridge_rom.get(offset).copied().unwrap_or(0xFF)
@@ -1488,7 +1603,7 @@ impl Arm7Bus for NdsBus {
             IO_BASE..=IO_END => self.write_io_byte(addr, val),
             PALETTE_BASE..=0x0500_0FFF => Self::write_region(&mut self.memory.palette, PALETTE_BASE, addr, val),
             VRAM_BASE..=0x060A_3FFF => Self::write_region(&mut self.memory.vram, VRAM_BASE, addr, val),
-            OAM_BASE..=0x0700_03FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, val),
+            OAM_BASE..=0x0700_07FF => Self::write_region(&mut self.memory.oam, OAM_BASE, addr, val),
             _ => {}
         }
     }
@@ -1517,7 +1632,8 @@ impl Arm7Bus for NdsBus {
 mod tests {
     use super::{
         NdsBus, REG_DISPCNT, REG_DISPSTAT, REG_EXTKEYIN, REG_IPCFIFOCNT, REG_IPCFIFOSEND,
-        REG_KEYINPUT, REG_VCOUNT, REG_VRAMCNT_A, REG_VRAMCNT_C, VRAM_BANK_OFFSETS,
+        REG_KEYINPUT, REG_VCOUNT, REG_VRAMCNT_A, REG_VRAMCNT_C, REG_VRAMCNT_D,
+        VRAM_BANK_OFFSETS,
     };
     use crate::cpu::arm7tdmi::{Arm7Bus, Arm7Tdmi};
     use crate::emulator::nds::NdsRomHeader;
@@ -1757,5 +1873,25 @@ mod tests {
         assert_eq!(bus.memory.vram[VRAM_BANK_OFFSETS[2]], 0xA5);
         assert_eq!(bus.mapped_main_bg_vram()[0], 0x5A);
         assert_eq!(bus.mapped_sub_bg_vram()[0], 0xA5);
+    }
+
+    #[test]
+    fn nds_bus_vramcnt_maps_main_and_sub_obj_windows() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+        let mut bus = NdsBus::new(rom, &header).expect("bus should initialize");
+
+        {
+            let mut arm9_bus = bus.arm9_view();
+            arm9_bus.write8(REG_VRAMCNT_A, 0x80 | 0x02);
+            arm9_bus.write8(REG_VRAMCNT_D, 0x80 | 0x04);
+            arm9_bus.write8(0x0640_0000, 0x3C);
+            arm9_bus.write8(0x0660_0000, 0xC3);
+        }
+
+        assert_eq!(bus.memory.vram[VRAM_BANK_OFFSETS[0]], 0x3C);
+        assert_eq!(bus.memory.vram[VRAM_BANK_OFFSETS[3]], 0xC3);
+        assert_eq!(bus.mapped_main_obj_vram()[0], 0x3C);
+        assert_eq!(bus.mapped_sub_obj_vram()[0], 0xC3);
     }
 }

@@ -14,8 +14,13 @@ const NDS_SCREEN_BYTES_16BPP: usize = NDS_SCREEN_PIXELS * 2;
 const MAIN_SCREEN_VRAM_OFFSET: usize = 0x00000;
 const SUB_SCREEN_VRAM_OFFSET: usize = 0x20000;
 const MAIN_BG_PALETTE_OFFSET: usize = 0x000;
+const MAIN_OBJ_PALETTE_OFFSET: usize = 0x200;
 const SUB_BG_PALETTE_OFFSET: usize = 0x400;
+const SUB_OBJ_PALETTE_OFFSET: usize = 0x600;
 const BG_ENABLE_BITS: [u32; 4] = [1 << 8, 1 << 9, 1 << 10, 1 << 11];
+const OBJ_ENABLE_BIT: u32 = 1 << 12;
+const OBJ_1D_MAPPING_BIT: u32 = 1 << 4;
+const OAM_SCREEN_BYTES: usize = 0x400;
 
 #[derive(Clone, Copy)]
 enum NdsBgKind {
@@ -195,6 +200,10 @@ impl NdsEmulator {
         self.refresh_placeholder_framebuffer();
         let main_bg_vram = self.bus.mapped_main_bg_vram();
         let sub_bg_vram = self.bus.mapped_sub_bg_vram();
+        let main_obj_vram = self.bus.mapped_main_obj_vram();
+        let sub_obj_vram = self.bus.mapped_sub_obj_vram();
+        let main_oam = self.bus.memory.oam[..OAM_SCREEN_BYTES].to_vec();
+        let sub_oam = self.bus.memory.oam[OAM_SCREEN_BYTES..OAM_SCREEN_BYTES * 2].to_vec();
         let main_state = (
             self.bus.ppu_main.dispcnt,
             self.bus.ppu_main.bgcnt,
@@ -208,6 +217,7 @@ impl NdsEmulator {
             self.bus.ppu_main.bg_ref_y,
             self.bus.ppu_main.master_bright,
         );
+        let mut main_priority_buffer = vec![4u8; NDS_SCREEN_PIXELS];
         if !self.render_bg_layers(
             0,
             &main_bg_vram,
@@ -223,9 +233,19 @@ impl NdsEmulator {
             main_state.8,
             main_state.9,
             main_state.10,
+            &mut main_priority_buffer,
         ) {
             self.render_screen_preview(0, MAIN_SCREEN_VRAM_OFFSET, main_state.0, main_state.10);
         }
+        self.render_obj_layers(
+            0,
+            &main_obj_vram,
+            &main_oam,
+            MAIN_OBJ_PALETTE_OFFSET,
+            main_state.0,
+            main_state.10,
+            &mut main_priority_buffer,
+        );
 
         let sub_state = (
             self.bus.ppu_sub.dispcnt,
@@ -240,6 +260,7 @@ impl NdsEmulator {
             self.bus.ppu_sub.bg_ref_y,
             self.bus.ppu_sub.master_bright,
         );
+        let mut sub_priority_buffer = vec![4u8; NDS_SCREEN_PIXELS];
         if !self.render_bg_layers(
             NDS_SCREEN_HEIGHT,
             &sub_bg_vram,
@@ -255,9 +276,19 @@ impl NdsEmulator {
             sub_state.8,
             sub_state.9,
             sub_state.10,
+            &mut sub_priority_buffer,
         ) {
             self.render_screen_preview(NDS_SCREEN_HEIGHT, SUB_SCREEN_VRAM_OFFSET, sub_state.0, sub_state.10);
         }
+        self.render_obj_layers(
+            NDS_SCREEN_HEIGHT,
+            &sub_obj_vram,
+            &sub_oam,
+            SUB_OBJ_PALETTE_OFFSET,
+            sub_state.0,
+            sub_state.10,
+            &mut sub_priority_buffer,
+        );
     }
 
     fn refresh_placeholder_framebuffer(&mut self) {
@@ -334,6 +365,7 @@ impl NdsEmulator {
         bg_ref_x: [i32; 2],
         bg_ref_y: [i32; 2],
         master_bright: u16,
+        priority_buffer: &mut [u8],
     ) -> bool {
         if !supports_2d_layer_render(dispcnt) {
             return false;
@@ -350,6 +382,7 @@ impl NdsEmulator {
         }
 
         let framebuffer = &mut self.framebuffer;
+        priority_buffer.fill(4);
         let backdrop = rgb555_to_argb(apply_master_brightness(read_color_16(palette, palette_offset), master_bright));
         for y in 0..NDS_SCREEN_HEIGHT {
             let row_start = (screen_y + y) * NDS_WIDTH;
@@ -393,6 +426,7 @@ impl NdsEmulator {
 
                     if let Some(raw_color) = raw_color {
                         framebuffer[row_start + px] = rgb555_to_argb(apply_master_brightness(raw_color, master_bright));
+                        priority_buffer[screen_line * NDS_WIDTH + px] = (bgcnt[layer.bg] & 0x3) as u8;
                         break;
                     }
                 }
@@ -400,6 +434,98 @@ impl NdsEmulator {
         }
 
         true
+    }
+
+    fn render_obj_layers(
+        &mut self,
+        screen_y: usize,
+        obj_vram: &[u8],
+        oam: &[u8],
+        palette_offset: usize,
+        dispcnt: u32,
+        master_bright: u16,
+        priority_buffer: &mut [u8],
+    ) {
+        if dispcnt & OBJ_ENABLE_BIT == 0 || ((dispcnt >> 16) & 0x3) != 0 {
+            return;
+        }
+
+        let palette = &self.bus.memory.palette;
+        let framebuffer = &mut self.framebuffer;
+        let obj_mapping_1d = dispcnt & OBJ_1D_MAPPING_BIT != 0;
+
+        for i in (0..128usize).rev() {
+            let base = i * 8;
+            if base + 5 >= oam.len() {
+                break;
+            }
+
+            let attr0 = u16::from_le_bytes([oam[base], oam[base + 1]]);
+            let attr1 = u16::from_le_bytes([oam[base + 2], oam[base + 3]]);
+            let attr2 = u16::from_le_bytes([oam[base + 4], oam[base + 5]]);
+
+            let affine = attr0 & 0x0100 != 0;
+            let double_size_or_disable = attr0 & 0x0200 != 0;
+            let obj_mode = (attr0 >> 10) & 0x3;
+            if affine || (!affine && double_size_or_disable) || obj_mode == 2 {
+                continue;
+            }
+
+            let (width, height) = obj_size((attr0 >> 14) & 0x3, (attr1 >> 14) & 0x3);
+            let y = (attr0 & 0xFF) as i32;
+            let y = if y >= 192 { y - 256 } else { y };
+            let x = (attr1 & 0x1FF) as i32;
+            let x = if x >= 256 { x - 512 } else { x };
+            let tile_num = (attr2 & 0x03FF) as usize;
+            let priority = ((attr2 >> 10) & 0x3) as u8;
+            let palette_num = ((attr2 >> 12) & 0xF) as usize;
+            let color_256 = attr0 & 0x2000 != 0;
+            let h_flip = attr1 & 0x1000 != 0;
+            let v_flip = attr1 & 0x2000 != 0;
+
+            for sprite_y in 0..height {
+                let screen_line = y + sprite_y as i32;
+                if !(0..NDS_SCREEN_HEIGHT as i32).contains(&screen_line) {
+                    continue;
+                }
+
+                let src_y = if v_flip { height - 1 - sprite_y } else { sprite_y };
+                let dst_row_start = (screen_y + screen_line as usize) * NDS_WIDTH;
+                let priority_row_start = screen_line as usize * NDS_WIDTH;
+
+                for sprite_x in 0..width {
+                    let screen_x = x + sprite_x as i32;
+                    if !(0..NDS_WIDTH as i32).contains(&screen_x) {
+                        continue;
+                    }
+
+                    let src_x = if h_flip { width - 1 - sprite_x } else { sprite_x };
+                    let Some(color) = sample_obj_pixel(
+                        obj_vram,
+                        palette,
+                        palette_offset,
+                        tile_num,
+                        palette_num,
+                        color_256,
+                        obj_mapping_1d,
+                        width,
+                        src_x,
+                        src_y,
+                    ) else {
+                        continue;
+                    };
+
+                    let priority_index = priority_row_start + screen_x as usize;
+                    if priority > priority_buffer[priority_index] {
+                        continue;
+                    }
+
+                    framebuffer[dst_row_start + screen_x as usize] =
+                        rgb555_to_argb(apply_master_brightness(color, master_bright));
+                    priority_buffer[priority_index] = priority;
+                }
+            }
+        }
     }
 
     fn screen_has_preview_data(&self, vram_offset: usize, dispcnt: u32, master_bright: u16) -> bool {
@@ -600,6 +726,79 @@ fn active_2d_bgs(dispcnt: u32, bgcnt: [u16; 4]) -> Vec<NdsBgLayer> {
     active
 }
 
+fn obj_size(shape: u16, size: u16) -> (usize, usize) {
+    match (shape, size) {
+        (0, 0) => (8, 8),
+        (0, 1) => (16, 16),
+        (0, 2) => (32, 32),
+        (0, 3) => (64, 64),
+        (1, 0) => (16, 8),
+        (1, 1) => (32, 8),
+        (1, 2) => (32, 16),
+        (1, 3) => (64, 32),
+        (2, 0) => (8, 16),
+        (2, 1) => (8, 32),
+        (2, 2) => (16, 32),
+        (2, 3) => (32, 64),
+        _ => (8, 8),
+    }
+}
+
+fn sample_obj_pixel(
+    obj_vram: &[u8],
+    palette: &[u8],
+    palette_offset: usize,
+    tile_num: usize,
+    palette_num: usize,
+    color_256: bool,
+    obj_mapping_1d: bool,
+    width: usize,
+    src_x: usize,
+    src_y: usize,
+) -> Option<u16> {
+    let tile_row = src_y / 8;
+    let fine_y = src_y % 8;
+    let tile_col = src_x / 8;
+    let fine_x = src_x % 8;
+
+    if color_256 {
+        let tile_offset = if obj_mapping_1d {
+            tile_num + tile_row * (width / 8) * 2 + tile_col * 2
+        } else {
+            tile_num + tile_row * 32 + tile_col * 2
+        };
+        let offset = tile_offset * 32 + fine_y * 8 + fine_x;
+        let palette_index = *obj_vram.get(offset)? as usize;
+        if palette_index == 0 {
+            return None;
+        }
+
+        let palette_entry = palette_offset + palette_index * 2;
+        if palette_entry + 1 >= palette.len() {
+            return None;
+        }
+        Some(read_color_16(palette, palette_entry))
+    } else {
+        let tile_offset = if obj_mapping_1d {
+            tile_num + tile_row * (width / 8) + tile_col
+        } else {
+            tile_num + tile_row * 32 + tile_col
+        };
+        let offset = tile_offset * 32 + fine_y * 4 + fine_x / 2;
+        let byte = *obj_vram.get(offset)?;
+        let palette_index = if fine_x & 1 == 0 { byte & 0x0F } else { byte >> 4 } as usize;
+        if palette_index == 0 {
+            return None;
+        }
+
+        let palette_entry = palette_offset + palette_num * 32 + palette_index * 2;
+        if palette_entry + 1 >= palette.len() {
+            return None;
+        }
+        Some(read_color_16(palette, palette_entry))
+    }
+}
+
 fn sample_text_bg_pixel(
     vram: &[u8],
     palette: &[u8],
@@ -753,14 +952,16 @@ fn sample_affine_bg_pixel(
 mod tests {
     use super::{
         apply_master_brightness, describe_video_warning, rgb555_to_argb, supports_2d_layer_render,
-        NdsEmulator, NdsRomHeader, BG_ENABLE_BITS,
-        MAIN_BG_PALETTE_OFFSET, MAIN_SCREEN_VRAM_OFFSET, NDS_SCREEN_HEIGHT, NDS_WIDTH,
-        SUB_BG_PALETTE_OFFSET, SUB_SCREEN_VRAM_OFFSET,
+        NdsEmulator, NdsRomHeader, BG_ENABLE_BITS, MAIN_BG_PALETTE_OFFSET,
+        MAIN_OBJ_PALETTE_OFFSET, MAIN_SCREEN_VRAM_OFFSET, NDS_SCREEN_HEIGHT, NDS_WIDTH,
+        OBJ_1D_MAPPING_BIT, OBJ_ENABLE_BIT, SUB_BG_PALETTE_OFFSET, SUB_OBJ_PALETTE_OFFSET,
+        SUB_SCREEN_VRAM_OFFSET,
     };
     use crate::cpu::arm7tdmi::Arm7Bus;
 
     const REG_VRAMCNT_A: u32 = 0x0400_0240;
     const REG_VRAMCNT_C: u32 = 0x0400_0242;
+    const REG_VRAMCNT_D: u32 = 0x0400_0243;
 
     fn build_test_rom() -> Vec<u8> {
         let mut rom = vec![0u8; 0x400];
@@ -948,6 +1149,50 @@ mod tests {
         emu.run_frame();
 
         assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x7C00));
+    }
+
+    #[test]
+    fn nds_emulator_renders_main_obj_sprites() {
+        let rom = build_test_rom();
+        let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
+
+        emu.bus.ppu_main.dispcnt = OBJ_ENABLE_BIT | OBJ_1D_MAPPING_BIT;
+        {
+            let mut arm9_bus = emu.bus.arm9_view();
+            arm9_bus.write8(REG_VRAMCNT_A, 0x80 | 0x02);
+            arm9_bus.write8(0x0640_0000, 1);
+            arm9_bus.write16(0x0700_0000, 0x2000);
+            arm9_bus.write16(0x0700_0002, 0);
+            arm9_bus.write16(0x0700_0004, 0);
+        }
+        emu.bus.memory.palette[MAIN_OBJ_PALETTE_OFFSET + 2..MAIN_OBJ_PALETTE_OFFSET + 4]
+            .copy_from_slice(&0x001Fu16.to_le_bytes());
+
+        emu.run_frame();
+
+        assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x001F));
+    }
+
+    #[test]
+    fn nds_emulator_renders_sub_obj_sprites() {
+        let rom = build_test_rom();
+        let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
+
+        emu.bus.ppu_sub.dispcnt = OBJ_ENABLE_BIT | OBJ_1D_MAPPING_BIT;
+        {
+            let mut arm9_bus = emu.bus.arm9_view();
+            arm9_bus.write8(REG_VRAMCNT_D, 0x80 | 0x04);
+            arm9_bus.write8(0x0660_0000, 1);
+            arm9_bus.write16(0x0700_0400, 0x2000);
+            arm9_bus.write16(0x0700_0402, 0);
+            arm9_bus.write16(0x0700_0404, 0);
+        }
+        emu.bus.memory.palette[SUB_OBJ_PALETTE_OFFSET + 2..SUB_OBJ_PALETTE_OFFSET + 4]
+            .copy_from_slice(&0x7C00u16.to_le_bytes());
+
+        emu.run_frame();
+
+        assert_eq!(emu.framebuffer[NDS_WIDTH * NDS_SCREEN_HEIGHT], rgb555_to_argb(0x7C00));
     }
 
     #[test]
