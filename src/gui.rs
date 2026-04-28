@@ -8,7 +8,8 @@ use eframe::egui::{self, Color32, RichText};
 use crate::cartridge::{GbaCartridge, GbcCartridge};
 use crate::emulator::gba::GbaEmulator;
 use crate::emulator::gbc::GbcEmulator;
-use crate::input::{GbaKey, GbcKey};
+use crate::emulator::nds::NdsEmulator;
+use crate::input::{GbaKey, GbcKey, NdsKey};
 use crate::save;
 use crate::ConsoleType;
 
@@ -16,6 +17,7 @@ enum Emulator {
     None,
     Gbc(GbcEmulator),
     Gba(GbaEmulator),
+    Nds(NdsEmulator),
 }
 
 impl Emulator {
@@ -27,6 +29,7 @@ impl Emulator {
         match self {
             Self::Gbc(_) => "Game Boy Color",
             Self::Gba(_) => "Game Boy Advance",
+            Self::Nds(_) => "Nintendo DS",
             Self::None => "No console",
         }
     }
@@ -35,6 +38,9 @@ impl Emulator {
         match self {
             Self::Gba(_) => {
                 "Z/X = A/B, Enter = Start, Backspace = Select, Arrows = D-Pad, A/S = L/R"
+            }
+            Self::Nds(_) => {
+                "Z/X = A/B, Q/W = X/Y, Enter = Start, Backspace = Select, Arrows = D-Pad, A/S = L/R"
             }
             Self::Gbc(_) | Self::None => {
                 "Z/X = A/B, Enter = Start, Backspace = Select, Arrows = D-Pad"
@@ -46,6 +52,7 @@ impl Emulator {
         match self {
             Self::Gbc(emu) => Some(emu.total_frames),
             Self::Gba(emu) => Some(emu.total_frames),
+            Self::Nds(emu) => Some(emu.total_frames),
             Self::None => None,
         }
     }
@@ -54,6 +61,7 @@ impl Emulator {
         match self {
             Self::Gbc(emu) => Some((emu.run_frame().to_vec(), emu.audio_buffer())),
             Self::Gba(emu) => Some((emu.run_frame().to_vec(), emu.audio_buffer())),
+            Self::Nds(emu) => Some((emu.run_frame().to_vec(), emu.audio_buffer())),
             Self::None => None,
         }
     }
@@ -62,6 +70,7 @@ impl Emulator {
         match self {
             Self::Gbc(emu) => Some((emu.screen_width() as usize, emu.screen_height() as usize)),
             Self::Gba(emu) => Some((emu.screen_width() as usize, emu.screen_height() as usize)),
+            Self::Nds(emu) => Some((emu.screen_width() as usize, emu.screen_height() as usize)),
             Self::None => None,
         }
     }
@@ -101,6 +110,15 @@ impl Emulator {
                     }
                 });
             }
+            Self::Nds(emu) => {
+                Self::apply_key_map(input, &NDS_KEY_MAP, |key, pressed| {
+                    if pressed {
+                        emu.input.key_down(key);
+                    } else {
+                        emu.input.key_up(key);
+                    }
+                });
+            }
             Self::None => {}
         }
     }
@@ -109,6 +127,7 @@ impl Emulator {
         match self {
             Self::Gbc(emu) => save::save_gbc_sram(path, emu),
             Self::Gba(emu) => save::save_gba_backup(path, emu),
+            Self::Nds(_) => {}
             Self::None => {}
         }
     }
@@ -117,6 +136,7 @@ impl Emulator {
         match self {
             Self::Gbc(emu) => save::save_gbc_state(path, slot, emu),
             Self::Gba(emu) => save::save_gba_state(path, slot, emu),
+            Self::Nds(emu) => save::save_nds_state(path, slot, emu),
             Self::None => Ok(()),
         }
     }
@@ -125,6 +145,7 @@ impl Emulator {
         match self {
             Self::Gbc(_) => save::load_gbc_state(path, slot).map(Self::Gbc).map(Some),
             Self::Gba(_) => save::load_gba_state(path, slot).map(Self::Gba).map(Some),
+            Self::Nds(_) => save::load_nds_state(path, slot).map(Self::Nds).map(Some),
             Self::None => Ok(None),
         }
     }
@@ -133,6 +154,7 @@ impl Emulator {
         match self {
             Self::Gbc(_) => &GBC_DEBUG_REGIONS,
             Self::Gba(_) => &GBA_DEBUG_REGIONS,
+            Self::Nds(_) => &NDS_DEBUG_REGIONS,
             Self::None => &[],
         }
     }
@@ -184,6 +206,36 @@ impl Emulator {
                 base_address: 0x0700_0000,
                 bytes: &emu.bus.ppu.oam,
             }),
+            (Self::Nds(emu), DebugMemoryRegion::NdsMainRam) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0200_0000,
+                bytes: &emu.memory.main_ram,
+            }),
+            (Self::Nds(emu), DebugMemoryRegion::NdsSharedWram) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0300_0000,
+                bytes: &emu.memory.shared_wram,
+            }),
+            (Self::Nds(emu), DebugMemoryRegion::NdsArm7Wram) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0380_0000,
+                bytes: &emu.memory.arm7_wram,
+            }),
+            (Self::Nds(emu), DebugMemoryRegion::NdsVram) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0600_0000,
+                bytes: &emu.memory.vram,
+            }),
+            (Self::Nds(emu), DebugMemoryRegion::NdsPalette) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0500_0000,
+                bytes: &emu.memory.palette,
+            }),
+            (Self::Nds(emu), DebugMemoryRegion::NdsOam) => Some(MemoryRegionView {
+                label: region.label(),
+                base_address: 0x0700_0000,
+                bytes: &emu.memory.oam,
+            }),
             _ => None,
         }
     }
@@ -193,9 +245,6 @@ const FRAME_DURATION: Duration = Duration::from_nanos(16_742_706);
 const MAX_AUDIO_BUFFER_SAMPLES: usize = 8192;
 const MAX_CATCH_UP_FRAMES: u32 = 4;
 const SIDE_PANEL_WIDTH: f32 = 220.0;
-const BACKGROUND_IMAGE_SIZE: egui::Vec2 = egui::vec2(1920.0, 1080.0);
-const BACKGROUND_SCREEN_MIN: egui::Vec2 = egui::vec2(551.0, 242.0);
-const BACKGROUND_SCREEN_SIZE: egui::Vec2 = egui::vec2(813.0, 542.0);
 const BUTTON_PRESS_IN_SPEED: f32 = 15.0;
 const BUTTON_PRESS_OUT_SPEED: f32 = 11.0;
 const BUTTON_OVERLAY_MAX_ALPHA: f32 = 50.0;
@@ -223,6 +272,94 @@ const GBA_KEY_MAP: [(egui::Key, GbaKey); 10] = [
     (egui::Key::A, GbaKey::L),
     (egui::Key::S, GbaKey::R),
 ];
+const NDS_KEY_MAP: [(egui::Key, NdsKey); 12] = [
+    (egui::Key::Z, NdsKey::A),
+    (egui::Key::X, NdsKey::B),
+    (egui::Key::Enter, NdsKey::Start),
+    (egui::Key::Backspace, NdsKey::Select),
+    (egui::Key::ArrowUp, NdsKey::Up),
+    (egui::Key::ArrowDown, NdsKey::Down),
+    (egui::Key::ArrowLeft, NdsKey::Left),
+    (egui::Key::ArrowRight, NdsKey::Right),
+    (egui::Key::A, NdsKey::L),
+    (egui::Key::S, NdsKey::R),
+    (egui::Key::Q, NdsKey::X),
+    (egui::Key::W, NdsKey::Y),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackgroundStyle {
+    Gb,
+    Gbc,
+    Gba,
+    Nds,
+}
+
+impl BackgroundStyle {
+    fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            "gb" => Some(Self::Gb),
+            "gbc" => Some(Self::Gbc),
+            "gba" => Some(Self::Gba),
+            "nds" => Some(Self::Nds),
+            _ => None,
+        }
+    }
+
+    fn from_path(path: &Path) -> Option<Self> {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(Self::from_extension)
+    }
+
+    fn texture_name(self) -> &'static str {
+        match self {
+            Self::Gb => "gb-overlay-background",
+            Self::Gbc => "gbc-overlay-background",
+            Self::Gba => "gba-overlay-background",
+            Self::Nds => "nds-overlay-background",
+        }
+    }
+
+    fn image_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Gb => include_bytes!("../resources/gb/background.jpeg"),
+            Self::Gbc => include_bytes!("../resources/gbc/background.jpeg"),
+            Self::Gba => include_bytes!("../resources/gba/background.png"),
+            Self::Nds => &[],
+        }
+    }
+
+    fn image_size(self) -> egui::Vec2 {
+        match self {
+            Self::Gb | Self::Gbc => egui::vec2(3840.0, 2160.0),
+            Self::Gba => egui::vec2(1920.0, 1080.0),
+            Self::Nds => egui::vec2(1024.0, 1680.0),
+        }
+    }
+
+    fn screen_min(self) -> egui::Vec2 {
+        match self {
+            Self::Gb => egui::vec2(1440.0, 432.0),
+            Self::Gbc => egui::vec2(1440.0, 405.0),
+            Self::Gba => egui::vec2(551.0, 242.0),
+            Self::Nds => egui::vec2(128.0, 264.0),
+        }
+    }
+
+    fn screen_size(self) -> egui::Vec2 {
+        match self {
+            Self::Gb => egui::vec2(960.0, 864.0),
+            Self::Gbc => egui::vec2(964.0, 862.0),
+            Self::Gba => egui::vec2(813.0, 542.0),
+            Self::Nds => egui::vec2(768.0, 1152.0),
+        }
+    }
+
+    fn shows_button_overlays(self) -> bool {
+        matches!(self, Self::Gba)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DebugMemoryRegion {
@@ -235,6 +372,12 @@ enum DebugMemoryRegion {
     GbaVram,
     GbaPalette,
     GbaOam,
+    NdsMainRam,
+    NdsSharedWram,
+    NdsArm7Wram,
+    NdsVram,
+    NdsPalette,
+    NdsOam,
 }
 
 impl DebugMemoryRegion {
@@ -249,6 +392,12 @@ impl DebugMemoryRegion {
             Self::GbaVram => "GBA VRAM",
             Self::GbaPalette => "GBA Palette",
             Self::GbaOam => "GBA OAM",
+            Self::NdsMainRam => "NDS Main RAM",
+            Self::NdsSharedWram => "NDS Shared WRAM",
+            Self::NdsArm7Wram => "NDS ARM7 WRAM",
+            Self::NdsVram => "NDS VRAM",
+            Self::NdsPalette => "NDS Palette",
+            Self::NdsOam => "NDS OAM",
         }
     }
 }
@@ -272,6 +421,15 @@ const GBA_DEBUG_REGIONS: [DebugMemoryRegion; 5] = [
     DebugMemoryRegion::GbaVram,
     DebugMemoryRegion::GbaPalette,
     DebugMemoryRegion::GbaOam,
+];
+
+const NDS_DEBUG_REGIONS: [DebugMemoryRegion; 6] = [
+    DebugMemoryRegion::NdsMainRam,
+    DebugMemoryRegion::NdsSharedWram,
+    DebugMemoryRegion::NdsArm7Wram,
+    DebugMemoryRegion::NdsVram,
+    DebugMemoryRegion::NdsPalette,
+    DebugMemoryRegion::NdsOam,
 ];
 
 #[derive(Clone, Copy)]
@@ -506,6 +664,7 @@ impl ButtonOverlays {
 pub struct EmuApp {
     emu: Emulator,
     rom_path: Option<PathBuf>,
+    background_style: BackgroundStyle,
     background_texture: egui::TextureHandle,
     button_overlays: ButtonOverlays,
     texture: Option<egui::TextureHandle>,
@@ -552,12 +711,14 @@ impl EmuApp {
         style.spacing.button_padding = egui::vec2(12.0, 8.0);
         cc.egui_ctx.set_style(style);
 
-        let background_texture = Self::load_background_texture(&cc.egui_ctx);
+        let background_style = BackgroundStyle::Gba;
+        let background_texture = Self::load_background_texture(&cc.egui_ctx, background_style);
         let button_overlays = ButtonOverlays::load(&cc.egui_ctx);
 
         Self {
             emu: Emulator::None,
             rom_path: None,
+            background_style,
             background_texture,
             button_overlays,
             texture: None,
@@ -582,18 +743,80 @@ impl EmuApp {
         }
     }
 
-    fn load_background_texture(ctx: &egui::Context) -> egui::TextureHandle {
-        let image = image::load_from_memory(include_bytes!("../resources/gba/background.png"))
-            .expect("background.png should be a valid PNG")
-            .to_rgba8();
-        let size = [image.width() as usize, image.height() as usize];
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    fn load_background_texture(
+        ctx: &egui::Context,
+        background_style: BackgroundStyle,
+    ) -> egui::TextureHandle {
+        let color_image = match background_style {
+            BackgroundStyle::Nds => Self::build_nds_background_image(),
+            _ => {
+                let image = image::load_from_memory(background_style.image_bytes())
+                    .expect("background image should be a valid texture")
+                    .to_rgba8();
+                let size = [image.width() as usize, image.height() as usize];
+                egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw())
+            }
+        };
 
         ctx.load_texture(
-            "gba-overlay-background",
+            background_style.texture_name(),
             color_image,
             egui::TextureOptions::LINEAR,
         )
+    }
+
+    fn build_nds_background_image() -> egui::ColorImage {
+        let width = 1024usize;
+        let height = 1680usize;
+        let mut pixels = vec![Color32::from_rgb(12, 14, 18); width * height];
+
+        for y in 0..height {
+            let t = y as f32 / (height.saturating_sub(1)) as f32;
+            let r = (18.0 + 18.0 * (1.0 - t)) as u8;
+            let g = (22.0 + 20.0 * (1.0 - t)) as u8;
+            let b = (28.0 + 28.0 * (1.0 - t)) as u8;
+            let row_color = Color32::from_rgb(r, g, b);
+
+            for x in 0..width {
+                pixels[y * width + x] = row_color;
+            }
+        }
+
+        let shell_min_x = 80usize;
+        let shell_max_x = width - 80;
+        let shell_min_y = 96usize;
+        let shell_max_y = height - 96;
+        for y in shell_min_y..shell_max_y {
+            for x in shell_min_x..shell_max_x {
+                pixels[y * width + x] = Color32::from_rgb(32, 36, 44);
+            }
+        }
+
+        let hinge_min_y = 776usize;
+        let hinge_max_y = 904usize;
+        for y in hinge_min_y..hinge_max_y {
+            for x in shell_min_x + 56..shell_max_x - 56 {
+                pixels[y * width + x] = Color32::from_rgb(40, 44, 54);
+            }
+        }
+
+        egui::ColorImage {
+            size: [width, height],
+            pixels,
+        }
+    }
+
+    fn apply_background_style(&mut self, ctx: &egui::Context, background_style: BackgroundStyle) {
+        if self.background_style == background_style {
+            return;
+        }
+
+        self.background_style = background_style;
+        self.background_texture = Self::load_background_texture(ctx, background_style);
+
+        if !background_style.shows_button_overlays() {
+            self.button_animation.fill(0.0);
+        }
     }
 
     fn format_memory_line(base_address: usize, bytes: &[u8]) -> String {
@@ -698,10 +921,83 @@ impl EmuApp {
         ));
     }
 
+    fn draw_nds_registers(ui: &mut egui::Ui, emu: &NdsEmulator) {
+        ui.label(format!(
+            "{} | Code={} | Maker={}",
+            emu.header.display_title(),
+            emu.header.game_code,
+            emu.header.maker_code
+        ));
+        ui.label(format!(
+            "ARM9 entry=0x{:08X} load=0x{:08X} size=0x{:X} | ARM7 entry=0x{:08X} load=0x{:08X} size=0x{:X}",
+            emu.header.arm9_entry_address,
+            emu.header.arm9_ram_address,
+            emu.header.arm9_size,
+            emu.header.arm7_entry_address,
+            emu.header.arm7_ram_address,
+            emu.header.arm7_size,
+        ));
+        ui.label(format!(
+            "KEYINPUT=0x{:04X} EXTKEYIN=0x{:04X} Touch=({}, {}) pressed={}",
+            emu.input.read_keyinput(),
+            emu.input.read_extkeyin(),
+            emu.input.touchscreen_x,
+            emu.input.touchscreen_y,
+            emu.input.touchscreen_pressed,
+        ));
+
+        ui.separator();
+        ui.label(RichText::new("ARM9").strong());
+        egui::Grid::new("nds_arm9_register_grid")
+            .num_columns(4)
+            .spacing([16.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for row in 0..4 {
+                    for col in 0..4 {
+                        let index = row * 4 + col;
+                        ui.monospace(format!("R{:02} {:08X}", index, emu.arm9.regs[index]));
+                    }
+                    ui.end_row();
+                }
+            });
+        ui.label(format!(
+            "CPSR {:08X} | Mode={:?} | Halted={} | Cycles={}",
+            emu.arm9.cpsr,
+            crate::cpu::arm7tdmi::CpuMode::from_bits(emu.arm9.cpsr),
+            emu.arm9.halted,
+            emu.arm9.cycles,
+        ));
+
+        ui.separator();
+        ui.label(RichText::new("ARM7").strong());
+        egui::Grid::new("nds_arm7_register_grid")
+            .num_columns(4)
+            .spacing([16.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for row in 0..4 {
+                    for col in 0..4 {
+                        let index = row * 4 + col;
+                        ui.monospace(format!("R{:02} {:08X}", index, emu.arm7.regs[index]));
+                    }
+                    ui.end_row();
+                }
+            });
+        ui.label(format!(
+            "CPSR {:08X} | Mode={:?} | Halted={} | Cycles={}",
+            emu.arm7.cpsr,
+            crate::cpu::arm7tdmi::CpuMode::from_bits(emu.arm7.cpsr),
+            emu.arm7.halted,
+            emu.arm7.cycles,
+        ));
+    }
+
     fn draw_registers_contents(&mut self, ui: &mut egui::Ui) {
         match &self.emu {
             Emulator::Gbc(emu) => Self::draw_gbc_registers(ui, emu),
             Emulator::Gba(emu) => Self::draw_gba_registers(ui, emu),
+            Emulator::Nds(emu) => Self::draw_nds_registers(ui, emu),
             Emulator::None => {
                 ui.label("Load a ROM to inspect register state.");
             }
@@ -825,8 +1121,9 @@ impl EmuApp {
         });
     }
 
-    fn fit_background(available: egui::Vec2) -> egui::Vec2 {
-        let aspect = BACKGROUND_IMAGE_SIZE.x / BACKGROUND_IMAGE_SIZE.y;
+    fn fit_background(&self, available: egui::Vec2) -> egui::Vec2 {
+        let image_size = self.background_style.image_size();
+        let aspect = image_size.x / image_size.y;
         if available.x / available.y > aspect {
             egui::vec2(available.y * aspect, available.y)
         } else {
@@ -834,14 +1131,19 @@ impl EmuApp {
         }
     }
 
-    fn background_screen_rect(background_rect: egui::Rect) -> egui::Rect {
-        let scale = background_rect.width() / BACKGROUND_IMAGE_SIZE.x;
-        let min = background_rect.min + BACKGROUND_SCREEN_MIN * scale;
-        let size = BACKGROUND_SCREEN_SIZE * scale;
+    fn background_screen_rect(&self, background_rect: egui::Rect) -> egui::Rect {
+        let image_size = self.background_style.image_size();
+        let scale = background_rect.width() / image_size.x;
+        let min = background_rect.min + self.background_style.screen_min() * scale;
+        let size = self.background_style.screen_size() * scale;
         egui::Rect::from_min_size(min, size)
     }
 
     fn update_button_animation(&mut self, ctx: &egui::Context, elapsed: Duration) -> bool {
+        if !self.background_style.shows_button_overlays() {
+            return false;
+        }
+
         let delta_seconds = elapsed.as_secs_f32().min(0.05);
         if delta_seconds <= f32::EPSILON {
             return false;
@@ -867,7 +1169,11 @@ impl EmuApp {
     }
 
     fn draw_button_overlays(&self, painter: &egui::Painter, background_rect: egui::Rect) {
-        let scale = background_rect.width() / BACKGROUND_IMAGE_SIZE.x;
+        if !self.background_style.shows_button_overlays() {
+            return;
+        }
+
+        let scale = background_rect.width() / self.background_style.image_size().x;
         let full_uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
         for button in OverlayButton::ALL {
@@ -999,13 +1305,13 @@ impl EmuApp {
         matches!(self.emu.total_frames(), Some(total_frames) if total_frames != 0 && total_frames % 60 == 0)
     }
 
-    fn open_rom_dialog(&mut self) {
+    fn open_rom_dialog(&mut self, ctx: &egui::Context) {
         let file = rfd::FileDialog::new()
-            .add_filter("ROMs", &["gb", "gbc", "gba"])
+            .add_filter("ROMs", &["gb", "gbc", "gba", "nds"])
             .pick_file();
 
         if let Some(path) = file {
-            self.load_rom(path);
+            self.load_rom(ctx, path);
         }
     }
 
@@ -1027,7 +1333,7 @@ impl EmuApp {
         }
     }
 
-    fn load_rom(&mut self, path: PathBuf) {
+    fn load_rom(&mut self, ctx: &egui::Context, path: PathBuf) {
         let ext = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -1035,6 +1341,10 @@ impl EmuApp {
 
         let Some(console) = ConsoleType::from_extension(&ext) else {
             self.status_msg = format!("Unknown file extension: .{}", ext);
+            return;
+        };
+        let Some(background_style) = BackgroundStyle::from_extension(ext) else {
+            self.status_msg = format!("Unsupported background for extension: .{}", ext);
             return;
         };
 
@@ -1048,24 +1358,37 @@ impl EmuApp {
 
         let rom_name = self.rom_name_from_path(&path);
 
-        let console_name = match console {
+        let status_msg = match console {
             ConsoleType::GameBoyColor => {
                 let cart = GbcCartridge::load(rom_data);
                 let mut emu = GbcEmulator::new(cart);
                 save::load_gbc_sram(&path, &mut emu);
                 self.emu = Emulator::Gbc(emu);
-                "GBC"
+                format!("Loaded GBC ROM: {}", rom_name)
             }
             ConsoleType::GameBoyAdvance => {
                 let cart = GbaCartridge::load(rom_data);
                 let mut emu = GbaEmulator::new(cart);
                 save::load_gba_backup(&path, &mut emu);
                 self.emu = Emulator::Gba(emu);
-                "GBA"
+                format!("Loaded GBA ROM: {}", rom_name)
+            }
+            ConsoleType::NintendoDs => {
+                let emu = match NdsEmulator::new(rom_data) {
+                    Ok(emu) => emu,
+                    Err(error) => {
+                        self.status_msg = format!("Failed to load NDS ROM: {}", error);
+                        return;
+                    }
+                };
+                let title = emu.header.display_title().to_string();
+                self.emu = Emulator::Nds(emu);
+                format!("Loaded NDS ROM shell: {} ({})", rom_name, title)
             }
         };
 
-        self.status_msg = format!("Loaded {} ROM: {}", console_name, rom_name);
+        self.apply_background_style(ctx, background_style);
+        self.status_msg = status_msg;
         self.finish_rom_load(path);
     }
 
@@ -1139,11 +1462,14 @@ impl EmuApp {
         }
     }
 
-    fn load_state(&mut self) {
+    fn load_state(&mut self, ctx: &egui::Context) {
         if let Some(path) = self.rom_path.as_deref() {
             match self.load_state_from_slot(path) {
                 Ok(Some(emu)) => {
                     self.emu = emu;
+                    if let Some(background_style) = BackgroundStyle::from_path(path) {
+                        self.apply_background_style(ctx, background_style);
+                    }
                     self.sync_screen_dimensions();
                     self.reset_timing();
                     self.status_msg = format!("State loaded from slot {}", self.save_slot);
@@ -1164,9 +1490,9 @@ impl EmuApp {
         self.emu.load_state(path, self.save_slot)
     }
 
-    fn reset_emulator(&mut self) {
+    fn reset_emulator(&mut self, ctx: &egui::Context) {
         if let Some(path) = self.rom_path.clone() {
-            self.load_rom(path);
+            self.load_rom(ctx, path);
         }
     }
 
@@ -1211,7 +1537,7 @@ impl EmuApp {
                 }
 
                 if ui.add_enabled(has_rom, egui::Button::new("Reset")).clicked() {
-                    self.reset_emulator();
+                    self.reset_emulator(ctx);
                 }
 
                 if ui.button("Quit").clicked() {
@@ -1228,7 +1554,7 @@ impl EmuApp {
         });
     }
 
-    fn draw_side_panel(&mut self, ctx: &egui::Context, open_rom: &mut bool) -> bool {
+    fn draw_side_panel(&mut self, ctx: &egui::Context, _open_rom: &mut bool) -> bool {
         let has_rom = self.has_rom_loaded();
         let mut display_changed = false;
 
@@ -1261,7 +1587,7 @@ impl EmuApp {
                         .add_sized([ui.available_width(), 28.0], egui::Button::new("Open ROM..."))
                         .clicked()
                     {
-                        *open_rom = true;
+                        self.open_rom_dialog(ctx);
                     }
 
                     if ui
@@ -1272,7 +1598,7 @@ impl EmuApp {
                     }
 
                     if ui.add_enabled(has_rom, egui::Button::new("Reset ROM")).clicked() {
-                        self.reset_emulator();
+                        self.reset_emulator(ctx);
                     }
                 });
 
@@ -1301,7 +1627,7 @@ impl EmuApp {
                         .add_enabled(has_rom, egui::Button::new("Load State"))
                         .clicked()
                     {
-                        self.load_state();
+                        self.load_state(ctx);
                     }
                 });
 
@@ -1365,7 +1691,7 @@ impl EmuApp {
                 let available = ui.available_size();
 
                 ui.centered_and_justified(|ui| {
-                    let background_size = Self::fit_background(available);
+                    let background_size = self.fit_background(available);
                     let (background_rect, _) =
                         ui.allocate_exact_size(background_size, egui::Sense::hover());
                     let painter = ui.painter_at(background_rect);
@@ -1373,8 +1699,8 @@ impl EmuApp {
                         egui::pos2(0.0, 0.0),
                         egui::pos2(1.0, 1.0),
                     );
-                    let screen_rect = Self::background_screen_rect(background_rect);
-                    let scale = background_rect.width() / BACKGROUND_IMAGE_SIZE.x;
+                    let screen_rect = self.background_screen_rect(background_rect);
+                    let scale = background_rect.width() / self.background_style.image_size().x;
                     let lcd_mask_rect = screen_rect.expand(4.0 * scale);
 
                     painter.image(
@@ -1484,7 +1810,7 @@ impl eframe::App for EmuApp {
         self.draw_memory_inspector_window(ctx);
 
         if open_rom {
-            self.open_rom_dialog();
+            self.open_rom_dialog(ctx);
         }
 
         if button_animation_changed {

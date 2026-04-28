@@ -1718,6 +1718,14 @@ mod tests {
         }
 
         #[test]
+        fn from_extension_nds() {
+            assert_eq!(
+                ConsoleType::from_extension("nds"),
+                Some(ConsoleType::NintendoDs)
+            );
+        }
+
+        #[test]
         fn from_extension_unknown() {
             assert_eq!(ConsoleType::from_extension("nes"), None);
         }
@@ -1728,6 +1736,8 @@ mod tests {
             assert_eq!(ConsoleType::GameBoyColor.screen_height(), 144);
             assert_eq!(ConsoleType::GameBoyAdvance.screen_width(), 240);
             assert_eq!(ConsoleType::GameBoyAdvance.screen_height(), 160);
+            assert_eq!(ConsoleType::NintendoDs.screen_width(), 256);
+            assert_eq!(ConsoleType::NintendoDs.screen_height(), 384);
         }
     }
 

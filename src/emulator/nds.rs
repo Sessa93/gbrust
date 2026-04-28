@@ -1,0 +1,394 @@
+use serde::{Deserialize, Serialize};
+
+use crate::cpu::arm7tdmi::{Arm7Tdmi, CpuMode};
+use crate::input::NdsInput;
+use crate::{NDS_HEIGHT, NDS_WIDTH};
+
+const NDS_SCREEN_HEIGHT: usize = NDS_HEIGHT / 2;
+const NDS_HEADER_SIZE: usize = 0x170;
+const NDS_ARM9_CYCLES_PER_FRAME: u32 = 1_117_132;
+const NDS_ARM7_CYCLES_PER_FRAME: u32 = 558_566;
+const NDS_MAIN_RAM_BASE: u32 = 0x0200_0000;
+const NDS_MAIN_RAM_SIZE: usize = 4 * 1024 * 1024;
+const NDS_SHARED_WRAM_BASE: u32 = 0x0300_0000;
+const NDS_SHARED_WRAM_SIZE: usize = 32 * 1024;
+const NDS_ARM7_WRAM_BASE: u32 = 0x0380_0000;
+const NDS_ARM7_WRAM_SIZE: usize = 64 * 1024;
+const NDS_VRAM_SIZE: usize = 0x000A_4000;
+const NDS_PALETTE_SIZE: usize = 0x1000;
+const NDS_OAM_SIZE: usize = 0x1000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NdsRomHeader {
+    pub game_title: String,
+    pub game_code: String,
+    pub maker_code: String,
+    pub unit_code: u8,
+    pub device_type: u8,
+    pub device_capacity: u8,
+    pub arm9_rom_offset: u32,
+    pub arm9_entry_address: u32,
+    pub arm9_ram_address: u32,
+    pub arm9_size: u32,
+    pub arm7_rom_offset: u32,
+    pub arm7_entry_address: u32,
+    pub arm7_ram_address: u32,
+    pub arm7_size: u32,
+}
+
+impl NdsRomHeader {
+    pub fn parse(rom: &[u8]) -> Result<Self, String> {
+        if rom.len() < NDS_HEADER_SIZE {
+            return Err(format!(
+                "ROM is too small for an NDS header: expected at least {} bytes, got {}",
+                NDS_HEADER_SIZE,
+                rom.len()
+            ));
+        }
+
+        let header = Self {
+            game_title: Self::read_ascii(rom, 0x000, 12),
+            game_code: Self::read_ascii(rom, 0x00C, 4),
+            maker_code: Self::read_ascii(rom, 0x010, 2),
+            unit_code: rom[0x012],
+            device_type: rom[0x013],
+            device_capacity: rom[0x014],
+            arm9_rom_offset: Self::read_u32(rom, 0x020),
+            arm9_entry_address: Self::read_u32(rom, 0x024),
+            arm9_ram_address: Self::read_u32(rom, 0x028),
+            arm9_size: Self::read_u32(rom, 0x02C),
+            arm7_rom_offset: Self::read_u32(rom, 0x030),
+            arm7_entry_address: Self::read_u32(rom, 0x034),
+            arm7_ram_address: Self::read_u32(rom, 0x038),
+            arm7_size: Self::read_u32(rom, 0x03C),
+        };
+
+        header.validate(rom.len())?;
+        Ok(header)
+    }
+
+    pub fn display_title(&self) -> &str {
+        if self.game_title.is_empty() {
+            "Untitled NDS ROM"
+        } else {
+            &self.game_title
+        }
+    }
+
+    fn validate(&self, rom_len: usize) -> Result<(), String> {
+        Self::validate_section("ARM9", self.arm9_rom_offset, self.arm9_size, rom_len)?;
+        Self::validate_section("ARM7", self.arm7_rom_offset, self.arm7_size, rom_len)?;
+        Ok(())
+    }
+
+    fn validate_section(name: &str, rom_offset: u32, size: u32, rom_len: usize) -> Result<(), String> {
+        if size == 0 {
+            return Err(format!("{} program section has zero length", name));
+        }
+
+        let end = rom_offset
+            .checked_add(size)
+            .ok_or_else(|| format!("{} program section overflows the header range", name))?;
+
+        if end as usize > rom_len {
+            return Err(format!(
+                "{} program section exceeds ROM size: end=0x{:X}, rom_len=0x{:X}",
+                name,
+                end,
+                rom_len
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn read_ascii(rom: &[u8], offset: usize, len: usize) -> String {
+        String::from_utf8_lossy(&rom[offset..offset + len])
+            .trim_matches(char::from(0))
+            .trim()
+            .to_string()
+    }
+
+    fn read_u32(rom: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(rom[offset..offset + 4].try_into().expect("header slice is in bounds"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NdsArm9 {
+    pub regs: [u32; 16],
+    pub cpsr: u32,
+    pub cycles: u64,
+    pub halted: bool,
+}
+
+impl NdsArm9 {
+    pub fn new(entry_address: u32) -> Self {
+        let mut regs = [0; 16];
+        regs[15] = entry_address & !3;
+        regs[13] = 0x0380_FF00;
+
+        Self {
+            regs,
+            cpsr: CpuMode::System as u32,
+            cycles: 0,
+            halted: false,
+        }
+    }
+
+    pub fn advance_placeholder(&mut self, cycles: u32) {
+        self.cycles += cycles as u64;
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NdsMemory {
+    pub main_ram: Vec<u8>,
+    pub shared_wram: Vec<u8>,
+    pub arm7_wram: Vec<u8>,
+    pub vram: Vec<u8>,
+    pub palette: Vec<u8>,
+    pub oam: Vec<u8>,
+}
+
+impl NdsMemory {
+    pub fn new() -> Self {
+        Self {
+            main_ram: vec![0; NDS_MAIN_RAM_SIZE],
+            shared_wram: vec![0; NDS_SHARED_WRAM_SIZE],
+            arm7_wram: vec![0; NDS_ARM7_WRAM_SIZE],
+            vram: vec![0; NDS_VRAM_SIZE],
+            palette: vec![0; NDS_PALETTE_SIZE],
+            oam: vec![0; NDS_OAM_SIZE],
+        }
+    }
+
+    pub fn load_program_sections(&mut self, rom: &[u8], header: &NdsRomHeader) -> Result<(), String> {
+        let arm9_start = header.arm9_rom_offset as usize;
+        let arm9_end = (header.arm9_rom_offset + header.arm9_size) as usize;
+        let arm7_start = header.arm7_rom_offset as usize;
+        let arm7_end = (header.arm7_rom_offset + header.arm7_size) as usize;
+
+        self.load_section("ARM9", header.arm9_ram_address, &rom[arm9_start..arm9_end])?;
+        self.load_section("ARM7", header.arm7_ram_address, &rom[arm7_start..arm7_end])?;
+
+        Ok(())
+    }
+
+    fn load_section(&mut self, name: &str, ram_address: u32, data: &[u8]) -> Result<(), String> {
+        if ram_address >= NDS_MAIN_RAM_BASE
+            && ram_address < NDS_MAIN_RAM_BASE + NDS_MAIN_RAM_SIZE as u32
+        {
+            return Self::copy_to_region(name, ram_address, data, NDS_MAIN_RAM_BASE, &mut self.main_ram);
+        }
+
+        if ram_address >= NDS_SHARED_WRAM_BASE
+            && ram_address < NDS_SHARED_WRAM_BASE + NDS_SHARED_WRAM_SIZE as u32
+        {
+            return Self::copy_to_region(
+                name,
+                ram_address,
+                data,
+                NDS_SHARED_WRAM_BASE,
+                &mut self.shared_wram,
+            );
+        }
+
+        if ram_address >= NDS_ARM7_WRAM_BASE
+            && ram_address < NDS_ARM7_WRAM_BASE + NDS_ARM7_WRAM_SIZE as u32
+        {
+            return Self::copy_to_region(name, ram_address, data, NDS_ARM7_WRAM_BASE, &mut self.arm7_wram);
+        }
+
+        Err(format!(
+            "{} RAM destination 0x{:08X} is outside the currently modelled NDS memory regions",
+            name,
+            ram_address
+        ))
+    }
+
+    fn copy_to_region(
+        name: &str,
+        ram_address: u32,
+        data: &[u8],
+        base_address: u32,
+        region: &mut [u8],
+    ) -> Result<(), String> {
+        let offset = (ram_address - base_address) as usize;
+        let end = offset + data.len();
+        if end > region.len() {
+            return Err(format!(
+                "{} program does not fit in region starting at 0x{:08X}: end offset 0x{:X}, region size 0x{:X}",
+                name,
+                base_address,
+                end,
+                region.len()
+            ));
+        }
+
+        region[offset..end].copy_from_slice(data);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NdsEmulator {
+    pub rom: Vec<u8>,
+    pub header: NdsRomHeader,
+    pub arm7: Arm7Tdmi,
+    pub arm9: NdsArm9,
+    pub input: NdsInput,
+    pub memory: NdsMemory,
+    pub framebuffer: Vec<u32>,
+    pub total_frames: u64,
+}
+
+impl NdsEmulator {
+    pub fn new(rom: Vec<u8>) -> Result<Self, String> {
+        let header = NdsRomHeader::parse(&rom)?;
+
+        let mut arm7 = Arm7Tdmi::new();
+        arm7.regs[15] = header.arm7_entry_address & !3;
+        arm7.regs[13] = 0x0380_FD80;
+        arm7.banked_regs[2][5] = 0x0380_FCC0;
+        arm7.banked_regs[3][5] = 0x0380_FDC0;
+
+        let arm9 = NdsArm9::new(header.arm9_entry_address);
+        let mut memory = NdsMemory::new();
+        memory.load_program_sections(&rom, &header)?;
+
+        let mut emu = Self {
+            rom,
+            header,
+            arm7,
+            arm9,
+            input: NdsInput::new(),
+            memory,
+            framebuffer: vec![0xFF11161C; NDS_WIDTH * NDS_HEIGHT],
+            total_frames: 0,
+        };
+        emu.refresh_placeholder_framebuffer();
+        Ok(emu)
+    }
+
+    fn refresh_placeholder_framebuffer(&mut self) {
+        let accent_seed = self
+            .header
+            .game_code
+            .bytes()
+            .chain(self.header.maker_code.bytes())
+            .fold(0u32, |acc, byte| acc.wrapping_mul(33).wrapping_add(byte as u32));
+        let accent_r = 64 + ((accent_seed >> 0) & 0x3F) as u8;
+        let accent_g = 96 + ((accent_seed >> 8) & 0x3F) as u8;
+        let accent_b = 128 + ((accent_seed >> 16) & 0x3F) as u8;
+        let sweep_line = (self.total_frames as usize * 2) % NDS_SCREEN_HEIGHT;
+
+        for y in 0..NDS_HEIGHT {
+            let in_top_screen = y < NDS_SCREEN_HEIGHT;
+            let screen_y = if in_top_screen { y } else { y - NDS_SCREEN_HEIGHT };
+
+            for x in 0..NDS_WIDTH {
+                let idx = y * NDS_WIDTH + x;
+                let border = x < 4
+                    || x >= NDS_WIDTH - 4
+                    || screen_y < 4
+                    || screen_y >= NDS_SCREEN_HEIGHT - 4;
+                let sweep_hit = screen_y.abs_diff(sweep_line) <= 1;
+
+                self.framebuffer[idx] = if border {
+                    argb(42, 48, 56)
+                } else if sweep_hit {
+                    argb(accent_r, accent_g, accent_b)
+                } else if in_top_screen {
+                    argb(22, 28, 36)
+                } else {
+                    argb(18, 23, 30)
+                };
+            }
+        }
+    }
+
+    pub fn run_frame(&mut self) -> &[u32] {
+        self.arm9.advance_placeholder(NDS_ARM9_CYCLES_PER_FRAME);
+        self.arm7.cycles += NDS_ARM7_CYCLES_PER_FRAME as u64;
+        self.total_frames += 1;
+        self.refresh_placeholder_framebuffer();
+        &self.framebuffer
+    }
+
+    pub fn screen_width(&self) -> u32 {
+        NDS_WIDTH as u32
+    }
+
+    pub fn screen_height(&self) -> u32 {
+        NDS_HEIGHT as u32
+    }
+
+    pub fn audio_buffer(&mut self) -> Vec<f32> {
+        Vec::new()
+    }
+}
+
+fn argb(r: u8, g: u8, b: u8) -> u32 {
+    0xFF00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NdsEmulator, NdsRomHeader};
+
+    fn build_test_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x400];
+        rom[0x000..0x00C].copy_from_slice(b"TEST CART   ");
+        rom[0x00C..0x010].copy_from_slice(b"TST0");
+        rom[0x010..0x012].copy_from_slice(b"AB");
+        rom[0x012] = 0;
+        rom[0x013] = 0;
+        rom[0x014] = 7;
+
+        rom[0x020..0x024].copy_from_slice(&0x0000_0200u32.to_le_bytes());
+        rom[0x024..0x028].copy_from_slice(&0x0200_0000u32.to_le_bytes());
+        rom[0x028..0x02C].copy_from_slice(&0x0200_0000u32.to_le_bytes());
+        rom[0x02C..0x030].copy_from_slice(&0x0000_0010u32.to_le_bytes());
+        rom[0x030..0x034].copy_from_slice(&0x0000_0300u32.to_le_bytes());
+        rom[0x034..0x038].copy_from_slice(&0x0380_0000u32.to_le_bytes());
+        rom[0x038..0x03C].copy_from_slice(&0x0380_0000u32.to_le_bytes());
+        rom[0x03C..0x040].copy_from_slice(&0x0000_0010u32.to_le_bytes());
+
+        for (index, byte) in (1u8..=16).enumerate() {
+            rom[0x200 + index] = byte;
+            rom[0x300 + index] = byte.wrapping_add(0x40);
+        }
+
+        rom
+    }
+
+    #[test]
+    fn nds_header_parser_extracts_program_sections() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+
+        assert_eq!(header.display_title(), "TEST CART");
+        assert_eq!(header.game_code, "TST0");
+        assert_eq!(header.maker_code, "AB");
+        assert_eq!(header.arm9_rom_offset, 0x200);
+        assert_eq!(header.arm7_rom_offset, 0x300);
+    }
+
+    #[test]
+    fn nds_emulator_bootstraps_dual_cpu_state_and_memory() {
+        let rom = build_test_rom();
+        let emu = NdsEmulator::new(rom.clone()).expect("test ROM should bootstrap");
+
+        assert_eq!(emu.arm9.regs[15], 0x0200_0000);
+        assert_eq!(emu.arm7.regs[15], 0x0380_0000);
+        assert_eq!(&emu.memory.main_ram[..16], &rom[0x200..0x210]);
+        assert_eq!(&emu.memory.arm7_wram[..16], &rom[0x300..0x310]);
+    }
+
+    #[test]
+    fn nds_emulator_rejects_short_roms() {
+        let result = NdsEmulator::new(vec![0; 0x80]);
+        assert!(matches!(result, Err(ref error) if error.contains("too small")));
+    }
+}

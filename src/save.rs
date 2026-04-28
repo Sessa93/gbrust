@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::emulator::gba::GbaEmulator;
 use crate::emulator::gbc::GbcEmulator;
+use crate::emulator::nds::NdsEmulator;
 
 const GBA_PALETTE_RAM_SIZE: usize = 0x400;
 const GBA_PALETTE_BANK_SIZE: usize = 0x20;
@@ -289,6 +290,23 @@ pub fn load_gba_state(rom_path: &Path, slot: u8) -> Result<GbaEmulator, String> 
     let mut emu: GbaEmulator =
         bincode::deserialize(&data).map_err(|e| format!("Deserialize error: {}", e))?;
     emu.repair_legacy_palette_state = repair_gba_palette_state_if_needed(&mut emu);
+    log::info!("Loaded state from {}", path.display());
+    Ok(emu)
+}
+
+pub fn save_nds_state(rom_path: &Path, slot: u8, emu: &NdsEmulator) -> Result<(), String> {
+    let path = save_path(rom_path, &format!("ss{}", slot));
+    let data = bincode::serialize(emu).map_err(|e| format!("Serialize error: {}", e))?;
+    fs::write(&path, &data).map_err(|e| format!("Write error: {}", e))?;
+    log::info!("Saved state to {}", path.display());
+    Ok(())
+}
+
+pub fn load_nds_state(rom_path: &Path, slot: u8) -> Result<NdsEmulator, String> {
+    let path = save_path(rom_path, &format!("ss{}", slot));
+    let data = fs::read(&path).map_err(|e| format!("Read error: {}", e))?;
+    let emu: NdsEmulator =
+        bincode::deserialize(&data).map_err(|e| format!("Deserialize error: {}", e))?;
     log::info!("Loaded state from {}", path.display());
     Ok(emu)
 }

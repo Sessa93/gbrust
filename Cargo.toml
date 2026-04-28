@@ -13,6 +13,6 @@ log = "0.4"
 env_logger = "0.11"
 rfd = "0.15"
 time = { version = "0.3", features = ["local-offset"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]

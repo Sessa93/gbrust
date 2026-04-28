@@ -117,3 +117,116 @@ pub enum GbaKey {
     R = 8,
     L = 9,
 }
+
+// ─── NDS Input ─────────────────────────────────────────
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NdsInput {
+    pub keyinput: u16,
+    pub extkeyin: u16,
+    pub touchscreen_x: u16,
+    pub touchscreen_y: u16,
+    pub touchscreen_pressed: bool,
+}
+
+impl NdsInput {
+    pub fn new() -> Self {
+        Self {
+            keyinput: 0x03FF,
+            extkeyin: 0x007F,
+            touchscreen_x: 0,
+            touchscreen_y: 0,
+            touchscreen_pressed: false,
+        }
+    }
+
+    pub fn read_keyinput(&self) -> u16 {
+        self.keyinput
+    }
+
+    pub fn read_extkeyin(&self) -> u16 {
+        self.extkeyin
+    }
+
+    pub fn key_down(&mut self, key: NdsKey) {
+        match key {
+            NdsKey::A
+            | NdsKey::B
+            | NdsKey::Select
+            | NdsKey::Start
+            | NdsKey::Right
+            | NdsKey::Left
+            | NdsKey::Up
+            | NdsKey::Down
+            | NdsKey::R
+            | NdsKey::L => {
+                self.keyinput &= !(1 << (key as u16));
+            }
+            NdsKey::X => self.extkeyin &= !0x0001,
+            NdsKey::Y => self.extkeyin &= !0x0002,
+        }
+    }
+
+    pub fn key_up(&mut self, key: NdsKey) {
+        match key {
+            NdsKey::A
+            | NdsKey::B
+            | NdsKey::Select
+            | NdsKey::Start
+            | NdsKey::Right
+            | NdsKey::Left
+            | NdsKey::Up
+            | NdsKey::Down
+            | NdsKey::R
+            | NdsKey::L => {
+                self.keyinput |= 1 << (key as u16);
+            }
+            NdsKey::X => self.extkeyin |= 0x0001,
+            NdsKey::Y => self.extkeyin |= 0x0002,
+        }
+    }
+
+    pub fn set_touchscreen(&mut self, x: u16, y: u16, pressed: bool) {
+        self.touchscreen_x = x;
+        self.touchscreen_y = y;
+        self.touchscreen_pressed = pressed;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NdsKey {
+    A = 0,
+    B = 1,
+    Select = 2,
+    Start = 3,
+    Right = 4,
+    Left = 5,
+    Up = 6,
+    Down = 7,
+    R = 8,
+    L = 9,
+    X,
+    Y,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NdsInput, NdsKey};
+
+    #[test]
+    fn nds_keys_use_active_low_registers() {
+        let mut input = NdsInput::new();
+
+        input.key_down(NdsKey::A);
+        input.key_down(NdsKey::X);
+
+        assert_eq!(input.read_keyinput() & 0x0001, 0);
+        assert_eq!(input.read_extkeyin() & 0x0001, 0);
+
+        input.key_up(NdsKey::A);
+        input.key_up(NdsKey::X);
+
+        assert_ne!(input.read_keyinput() & 0x0001, 0);
+        assert_ne!(input.read_extkeyin() & 0x0001, 0);
+    }
+}

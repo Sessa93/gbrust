@@ -15,6 +15,8 @@ pub const GBC_WIDTH: usize = 160;
 pub const GBC_HEIGHT: usize = 144;
 pub const GBA_WIDTH: usize = 240;
 pub const GBA_HEIGHT: usize = 160;
+pub const NDS_WIDTH: usize = 256;
+pub const NDS_HEIGHT: usize = 384;
 
 pub const GBC_CLOCK_SPEED: u32 = 4_194_304;
 pub const GBA_CLOCK_SPEED: u32 = 16_777_216;
@@ -23,6 +25,7 @@ pub const GBA_CLOCK_SPEED: u32 = 16_777_216;
 pub enum ConsoleType {
     GameBoyColor,
     GameBoyAdvance,
+    NintendoDs,
 }
 
 impl ConsoleType {
@@ -30,6 +33,7 @@ impl ConsoleType {
         match ext.to_lowercase().as_str() {
             "gbc" | "gb" => Some(ConsoleType::GameBoyColor),
             "gba" => Some(ConsoleType::GameBoyAdvance),
+            "nds" => Some(ConsoleType::NintendoDs),
             _ => None,
         }
     }
@@ -38,6 +42,7 @@ impl ConsoleType {
         match self {
             ConsoleType::GameBoyColor => GBC_WIDTH,
             ConsoleType::GameBoyAdvance => GBA_WIDTH,
+            ConsoleType::NintendoDs => NDS_WIDTH,
         }
     }
 
@@ -45,6 +50,7 @@ impl ConsoleType {
         match self {
             ConsoleType::GameBoyColor => GBC_HEIGHT,
             ConsoleType::GameBoyAdvance => GBA_HEIGHT,
+            ConsoleType::NintendoDs => NDS_HEIGHT,
         }
     }
 }
