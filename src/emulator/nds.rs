@@ -26,6 +26,8 @@ const OAM_SCREEN_BYTES: usize = 0x400;
 enum NdsBgKind {
     Text,
     Affine,
+    Bitmap8,
+    Bitmap16,
 }
 
 #[derive(Clone, Copy)]
@@ -405,6 +407,24 @@ impl NdsEmulator {
                             px,
                             screen_line,
                         ),
+                        NdsBgKind::Bitmap8 | NdsBgKind::Bitmap16 => {
+                            let affine_index = layer.bg - 2;
+                            sample_bitmap_bg_pixel(
+                                vram,
+                                palette,
+                                palette_offset,
+                                bgcnt[layer.bg],
+                                bg_pa[affine_index],
+                                bg_pb[affine_index],
+                                bg_pc[affine_index],
+                                bg_pd[affine_index],
+                                bg_ref_x[affine_index],
+                                bg_ref_y[affine_index],
+                                px,
+                                screen_line,
+                                matches!(layer.kind, NdsBgKind::Bitmap16),
+                            )
+                        }
                         NdsBgKind::Affine => {
                             let affine_index = layer.bg - 2;
                             sample_affine_bg_pixel(
@@ -446,7 +466,7 @@ impl NdsEmulator {
         master_bright: u16,
         priority_buffer: &mut [u8],
     ) {
-        if dispcnt & OBJ_ENABLE_BIT == 0 || ((dispcnt >> 16) & 0x3) != 0 {
+        if dispcnt & OBJ_ENABLE_BIT == 0 || ((dispcnt >> 16) & 0x3) > 1 {
             return;
         }
 
@@ -665,7 +685,7 @@ fn read_color_16(region: &[u8], offset: usize) -> u16 {
 fn supports_2d_layer_render(dispcnt: u32) -> bool {
     let display_mode = (dispcnt >> 16) & 0x3;
     let bg_mode = dispcnt & 0x7;
-    display_mode == 0 && bg_mode <= 2
+    display_mode <= 1 && bg_mode <= 5
 }
 
 fn describe_video_warning(name: &str, dispcnt: u32, disp3dcnt: u16) -> Option<String> {
@@ -673,10 +693,10 @@ fn describe_video_warning(name: &str, dispcnt: u32, disp3dcnt: u16) -> Option<St
     let bg_mode = dispcnt & 0x7;
     let mut reasons = Vec::new();
 
-    if display_mode != 0 {
+    if display_mode > 1 {
         reasons.push(format!("display mode {}", display_mode));
     }
-    if bg_mode > 2 {
+    if bg_mode > 5 {
         reasons.push(format!("BG mode {}", bg_mode));
     }
     if disp3dcnt != 0 {
@@ -695,26 +715,7 @@ fn active_2d_bgs(dispcnt: u32, bgcnt: [u16; 4]) -> Vec<NdsBgLayer> {
     let bg_mode = (dispcnt & 0x7) as u8;
     for bg in 0..4usize {
         let enabled = dispcnt & BG_ENABLE_BITS[bg] != 0;
-        let kind = match bg {
-            0 | 1 => Some(NdsBgKind::Text),
-            2 => {
-                if bg_mode == 0 {
-                    Some(NdsBgKind::Text)
-                } else {
-                    Some(NdsBgKind::Affine)
-                }
-            }
-            3 => {
-                if bg_mode == 0 {
-                    Some(NdsBgKind::Text)
-                } else if bg_mode >= 2 {
-                    Some(NdsBgKind::Affine)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
+        let kind = bg_kind(bg_mode, bg, bgcnt[bg]);
         if enabled {
             if let Some(kind) = kind {
                 active.push(NdsBgLayer { bg, kind });
@@ -724,6 +725,51 @@ fn active_2d_bgs(dispcnt: u32, bgcnt: [u16; 4]) -> Vec<NdsBgLayer> {
 
     active.sort_by_key(|layer| ((bgcnt[layer.bg] & 0x3) as usize, layer.bg));
     active
+}
+
+fn bg_kind(bg_mode: u8, bg: usize, bgcnt: u16) -> Option<NdsBgKind> {
+    match bg_mode {
+        0 => Some(NdsBgKind::Text),
+        1 => match bg {
+            0 | 1 | 2 => Some(NdsBgKind::Text),
+            3 => Some(bitmap_or_affine_kind(bgcnt)),
+            _ => None,
+        },
+        2 => match bg {
+            0 | 1 => Some(NdsBgKind::Text),
+            2 | 3 => Some(NdsBgKind::Affine),
+            _ => None,
+        },
+        3 => match bg {
+            0 | 1 | 2 => Some(NdsBgKind::Text),
+            3 => Some(bitmap_or_affine_kind(bgcnt)),
+            _ => None,
+        },
+        4 => match bg {
+            0 | 1 => Some(NdsBgKind::Text),
+            2 => Some(NdsBgKind::Affine),
+            3 => Some(bitmap_or_affine_kind(bgcnt)),
+            _ => None,
+        },
+        5 => match bg {
+            0 | 1 => Some(NdsBgKind::Text),
+            2 | 3 => Some(bitmap_or_affine_kind(bgcnt)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn bitmap_or_affine_kind(bgcnt: u16) -> NdsBgKind {
+    if bgcnt & 0x0080 != 0 {
+        if bgcnt & 0x0004 != 0 {
+            NdsBgKind::Bitmap16
+        } else {
+            NdsBgKind::Bitmap8
+        }
+    } else {
+        NdsBgKind::Affine
+    }
 }
 
 fn obj_size(shape: u16, size: u16) -> (usize, usize) {
@@ -948,6 +994,68 @@ fn sample_affine_bg_pixel(
     Some(read_color_16(palette, palette_entry))
 }
 
+fn sample_bitmap_bg_pixel(
+    vram: &[u8],
+    palette: &[u8],
+    palette_offset: usize,
+    bgcnt: u16,
+    bg_pa: i16,
+    bg_pb: i16,
+    bg_pc: i16,
+    bg_pd: i16,
+    bg_ref_x: i32,
+    bg_ref_y: i32,
+    px: usize,
+    screen_line: usize,
+    direct_color: bool,
+) -> Option<u16> {
+    let bitmap_base = ((bgcnt as usize >> 8) & 0x1F) * 0x4000;
+    let wrap = bgcnt & 0x2000 != 0;
+    let (width, height) = match (bgcnt >> 14) & 0x3 {
+        0 => (128i32, 128i32),
+        1 => (256i32, 256i32),
+        2 => (512i32, 256i32),
+        3 => (512i32, 512i32),
+        _ => (128i32, 128i32),
+    };
+    let tex_x = (bg_ref_x + bg_pa as i32 * px as i32 + bg_pb as i32 * screen_line as i32) >> 8;
+    let tex_y = (bg_ref_y + bg_pc as i32 * px as i32 + bg_pd as i32 * screen_line as i32) >> 8;
+
+    let (tx, ty) = if wrap {
+        (tex_x.rem_euclid(width), tex_y.rem_euclid(height))
+    } else {
+        if tex_x < 0 || tex_x >= width || tex_y < 0 || tex_y >= height {
+            return None;
+        }
+        (tex_x, tex_y)
+    };
+
+    let pixel_index = ty as usize * width as usize + tx as usize;
+    if direct_color {
+        let offset = bitmap_base + pixel_index * 2;
+        if offset + 1 >= vram.len() {
+            return None;
+        }
+        let color = read_color_16(vram, offset);
+        if color & 0x8000 == 0 {
+            return None;
+        }
+        Some(color & 0x7FFF)
+    } else {
+        let offset = bitmap_base + pixel_index;
+        let palette_index = *vram.get(offset)? as usize;
+        if palette_index == 0 {
+            return None;
+        }
+
+        let palette_entry = palette_offset + palette_index * 2;
+        if palette_entry + 1 >= palette.len() {
+            return None;
+        }
+        Some(read_color_16(palette, palette_entry))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1133,7 +1241,7 @@ mod tests {
         let rom = build_test_rom();
         let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
 
-        emu.bus.ppu_main.dispcnt = 1 | BG_ENABLE_BITS[2];
+        emu.bus.ppu_main.dispcnt = (1 << 16) | 1 | BG_ENABLE_BITS[2];
         emu.bus.ppu_main.bgcnt[2] = 1 << 8;
         emu.bus.ppu_main.bg_pa[0] = 0x0100;
         emu.bus.ppu_main.bg_pd[0] = 0x0100;
@@ -1149,6 +1257,48 @@ mod tests {
         emu.run_frame();
 
         assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x7C00));
+    }
+
+    #[test]
+    fn nds_emulator_renders_main_bg3_bitmap_layers() {
+        let rom = build_test_rom();
+        let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
+
+        emu.bus.ppu_main.dispcnt = (1 << 16) | 3 | BG_ENABLE_BITS[3];
+        emu.bus.ppu_main.bgcnt[3] = 0x0080 | (1 << 8);
+        emu.bus.ppu_main.bg_pa[1] = 0x0100;
+        emu.bus.ppu_main.bg_pd[1] = 0x0100;
+        {
+            let mut arm9_bus = emu.bus.arm9_view();
+            arm9_bus.write8(REG_VRAMCNT_A, 0x80 | 0x01);
+            arm9_bus.write8(0x0600_4000, 1);
+        }
+        emu.bus.memory.palette[MAIN_BG_PALETTE_OFFSET + 2..MAIN_BG_PALETTE_OFFSET + 4]
+            .copy_from_slice(&0x03E0u16.to_le_bytes());
+
+        emu.run_frame();
+
+        assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x03E0));
+    }
+
+    #[test]
+    fn nds_emulator_renders_sub_bg2_direct_bitmap_layers() {
+        let rom = build_test_rom();
+        let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
+
+        emu.bus.ppu_sub.dispcnt = (1 << 16) | 5 | BG_ENABLE_BITS[2];
+        emu.bus.ppu_sub.bgcnt[2] = 0x0080 | 0x0004 | (1 << 8);
+        emu.bus.ppu_sub.bg_pa[0] = 0x0100;
+        emu.bus.ppu_sub.bg_pd[0] = 0x0100;
+        {
+            let mut arm9_bus = emu.bus.arm9_view();
+            arm9_bus.write8(REG_VRAMCNT_C, 0x80 | 0x04);
+            arm9_bus.write16(0x0620_4000, 0x8000 | 0x001F);
+        }
+
+        emu.run_frame();
+
+        assert_eq!(emu.framebuffer[NDS_WIDTH * NDS_SCREEN_HEIGHT], rgb555_to_argb(0x001F));
     }
 
     #[test]
@@ -1198,15 +1348,17 @@ mod tests {
     #[test]
     fn nds_2d_renderer_rejects_unsupported_display_modes() {
         assert!(supports_2d_layer_render(BG_ENABLE_BITS[0]));
-        assert!(!supports_2d_layer_render(1 << 16));
-        assert!(!supports_2d_layer_render(3));
+        assert!(supports_2d_layer_render((1 << 16) | BG_ENABLE_BITS[0]));
+        assert!(supports_2d_layer_render((1 << 16) | 5 | BG_ENABLE_BITS[3]));
+        assert!(!supports_2d_layer_render(2 << 16));
+        assert!(!supports_2d_layer_render(6));
     }
 
     #[test]
     fn nds_video_warning_reports_unsupported_modes() {
-        let warning = describe_video_warning("Main", (1 << 16) | 5, 1).expect("warning expected");
-        assert!(warning.contains("display mode 1"));
-        assert!(warning.contains("BG mode 5"));
+        let warning = describe_video_warning("Main", (2 << 16) | 6, 1).expect("warning expected");
+        assert!(warning.contains("display mode 2"));
+        assert!(warning.contains("BG mode 6"));
         assert!(warning.contains("3D engine state"));
     }
 }
