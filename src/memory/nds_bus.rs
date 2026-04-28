@@ -11,6 +11,10 @@ const ARM7_BIOS_SIZE: usize = 0x4000;
 const ARM9_BIOS_SIZE: usize = 0x8000;
 const IO_SIZE: usize = 0x1000;
 const ARM9_BIOS_BASE: u32 = 0xFFFF_0000;
+const SCANLINE_CYCLES: u32 = 1232;
+const HBLANK_START_CYCLES: u32 = 960;
+const VISIBLE_SCANLINES: u16 = 192;
+const TOTAL_SCANLINES: u16 = 263;
 const MAIN_RAM_BASE: u32 = 0x0200_0000;
 const MAIN_RAM_SIZE: usize = 4 * 1024 * 1024;
 const SHARED_WRAM_BASE: u32 = 0x0300_0000;
@@ -30,6 +34,10 @@ const REG_KEYINPUT: u32 = 0x0400_0130;
 const REG_KEYINPUT_HI: u32 = REG_KEYINPUT + 1;
 const REG_EXTKEYIN: u32 = 0x0400_0136;
 const REG_EXTKEYIN_HI: u32 = REG_EXTKEYIN + 1;
+const REG_DISPSTAT: u32 = 0x0400_0004;
+const REG_DISPSTAT_HI: u32 = REG_DISPSTAT + 1;
+const REG_VCOUNT: u32 = 0x0400_0006;
+const REG_VCOUNT_HI: u32 = REG_VCOUNT + 1;
 const REG_IPCSYNC: u32 = 0x0400_0180;
 const REG_IPCSYNC_HI: u32 = REG_IPCSYNC + 1;
 const REG_IPCFIFOCNT: u32 = 0x0400_0184;
@@ -77,6 +85,23 @@ pub struct NdsMemory {
     pub vram: Vec<u8>,
     pub palette: Vec<u8>,
     pub oam: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NdsVideoState {
+    pub vcount: u16,
+    pub line_cycles: u32,
+    pub in_hblank: bool,
+}
+
+impl NdsVideoState {
+    fn new() -> Self {
+        Self {
+            vcount: 0,
+            line_cycles: 0,
+            in_hblank: false,
+        }
+    }
 }
 
 impl NdsMemory {
@@ -158,6 +183,9 @@ pub struct NdsBus {
     pub input: NdsInput,
     pub memory: NdsMemory,
     pub io: Vec<u8>,
+    pub video: NdsVideoState,
+    pub dispstat: u16,
+    pub arm9_dispstat: u16,
     pub timers: GbaTimers,
     pub arm9_timers: GbaTimers,
     pub dma: GbaDma,
@@ -191,6 +219,9 @@ impl NdsBus {
             input: NdsInput::new(),
             memory,
             io: vec![0; IO_SIZE],
+            video: NdsVideoState::new(),
+            dispstat: 0,
+            arm9_dispstat: 0,
             timers: GbaTimers::new(),
             arm9_timers: GbaTimers::new(),
             dma: GbaDma::new(),
@@ -247,6 +278,7 @@ impl NdsBus {
     pub fn tick_arm9(&mut self, cycles: u32) {
         let (timer_irqs, _) = self.arm9_timers.tick(cycles);
         self.arm9_iflag |= timer_irqs as u32;
+        self.tick_video(cycles);
         self.process_dma(NdsCpu::Arm9);
         self.arm9_cycles += cycles as u64;
         if self.arm9_halt && self.arm9_check_irq() {
@@ -271,6 +303,111 @@ impl NdsBus {
             self.input.key_down(key);
         } else {
             self.input.key_up(key);
+        }
+    }
+
+    pub fn read_dispstat_value(&self) -> u16 {
+        self.read_dispstat(NdsCpu::Arm7)
+    }
+
+    pub fn read_arm9_dispstat_value(&self) -> u16 {
+        self.read_dispstat(NdsCpu::Arm9)
+    }
+
+    fn in_vblank(&self) -> bool {
+        self.video.vcount >= VISIBLE_SCANLINES && self.video.vcount < TOTAL_SCANLINES
+    }
+
+    fn read_dispstat(&self, cpu: NdsCpu) -> u16 {
+        let control = match cpu {
+            NdsCpu::Arm7 => self.dispstat,
+            NdsCpu::Arm9 => self.arm9_dispstat,
+        } & 0xFFF8;
+
+        let vblank = if self.in_vblank() { 1 } else { 0 };
+        let hblank = if self.video.in_hblank && self.video.vcount < VISIBLE_SCANLINES { 2 } else { 0 };
+        let vcounter = if self.video.vcount == (control >> 8) { 4 } else { 0 };
+
+        control | vblank | hblank | vcounter
+    }
+
+    fn write_dispstat_byte(&mut self, cpu: NdsCpu, byte: u32, value: u8) {
+        let dispstat = match cpu {
+            NdsCpu::Arm7 => &mut self.dispstat,
+            NdsCpu::Arm9 => &mut self.arm9_dispstat,
+        };
+
+        if byte == 0 {
+            *dispstat = (*dispstat & 0xFF07) | ((value as u16) & 0x0038);
+        } else {
+            *dispstat = (*dispstat & 0x00FF) | ((value as u16) << 8);
+        }
+    }
+
+    fn tick_video(&mut self, cycles: u32) {
+        let mut remaining = cycles;
+
+        while remaining > 0 {
+            let boundary = if self.video.in_hblank {
+                SCANLINE_CYCLES - self.video.line_cycles
+            } else {
+                HBLANK_START_CYCLES.saturating_sub(self.video.line_cycles)
+            };
+            let step = boundary.min(remaining);
+            self.video.line_cycles += step;
+            remaining -= step;
+
+            if self.video.in_hblank {
+                if self.video.line_cycles < SCANLINE_CYCLES {
+                    continue;
+                }
+
+                self.video.in_hblank = false;
+                self.video.line_cycles = 0;
+                self.video.vcount += 1;
+
+                if self.video.vcount == VISIBLE_SCANLINES {
+                    self.dma.notify_vblank();
+                    self.arm9_dma.notify_vblank();
+                    if self.dispstat & 0x0008 != 0 {
+                        self.iflag |= crate::interrupts::gba::VBLANK as u32;
+                    }
+                    if self.arm9_dispstat & 0x0008 != 0 {
+                        self.arm9_iflag |= crate::interrupts::gba::VBLANK as u32;
+                    }
+                }
+
+                if self.video.vcount >= TOTAL_SCANLINES {
+                    self.video.vcount = 0;
+                }
+
+                self.update_vcounter_irq();
+            } else {
+                if self.video.line_cycles < HBLANK_START_CYCLES {
+                    continue;
+                }
+
+                self.video.in_hblank = true;
+                if self.video.vcount < VISIBLE_SCANLINES {
+                    self.dma.notify_hblank();
+                    self.arm9_dma.notify_hblank();
+                    if self.dispstat & 0x0010 != 0 {
+                        self.iflag |= crate::interrupts::gba::HBLANK as u32;
+                    }
+                    if self.arm9_dispstat & 0x0010 != 0 {
+                        self.arm9_iflag |= crate::interrupts::gba::HBLANK as u32;
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_vcounter_irq(&mut self) {
+        if self.video.vcount == (self.dispstat >> 8) && self.dispstat & 0x0020 != 0 {
+            self.iflag |= crate::interrupts::gba::VCOUNTER as u32;
+        }
+        if self.video.vcount == (self.arm9_dispstat >> 8) && self.arm9_dispstat & 0x0020 != 0 {
+            self.arm9_iflag |= crate::interrupts::gba::VCOUNTER as u32;
         }
     }
 
@@ -574,6 +711,10 @@ impl NdsBus {
 
     fn read_io_byte(&self, addr: u32) -> u8 {
         match addr {
+            REG_DISPSTAT => self.read_dispstat(NdsCpu::Arm7) as u8,
+            REG_DISPSTAT_HI => (self.read_dispstat(NdsCpu::Arm7) >> 8) as u8,
+            REG_VCOUNT => self.video.vcount as u8,
+            REG_VCOUNT_HI => (self.video.vcount >> 8) as u8,
             0x0400_00B0..=0x0400_00DF => self.dma.read(addr - IO_BASE),
             0x0400_0100..=0x0400_010F => self.timers.read(addr - IO_BASE),
             REG_KEYINPUT => self.input.read_keyinput() as u8,
@@ -609,6 +750,10 @@ impl NdsBus {
 
     fn read_arm9_io_byte(&self, addr: u32) -> u8 {
         match addr {
+            REG_DISPSTAT => self.read_dispstat(NdsCpu::Arm9) as u8,
+            REG_DISPSTAT_HI => (self.read_dispstat(NdsCpu::Arm9) >> 8) as u8,
+            REG_VCOUNT => self.video.vcount as u8,
+            REG_VCOUNT_HI => (self.video.vcount >> 8) as u8,
             0x0400_00B0..=0x0400_00DF => self.arm9_dma.read(addr - IO_BASE),
             0x0400_0100..=0x0400_010F => self.arm9_timers.read(addr - IO_BASE),
             REG_IPCSYNC => self.read_ipcsync(NdsCpu::Arm9) as u8,
@@ -640,6 +785,8 @@ impl NdsBus {
 
     fn write_io_byte(&mut self, addr: u32, value: u8) {
         match addr {
+            REG_DISPSTAT => self.write_dispstat_byte(NdsCpu::Arm7, 0, value),
+            REG_DISPSTAT_HI => self.write_dispstat_byte(NdsCpu::Arm7, 1, value),
             0x0400_00B0..=0x0400_00DF => self.dma.write(addr - IO_BASE, value),
             0x0400_0100..=0x0400_010F => self.timers.write(addr - IO_BASE, value),
             REG_IPCSYNC => self.write_ipcsync(NdsCpu::Arm7, value as u16),
@@ -666,6 +813,8 @@ impl NdsBus {
 
     fn write_arm9_io_byte(&mut self, addr: u32, value: u8) {
         match addr {
+            REG_DISPSTAT => self.write_dispstat_byte(NdsCpu::Arm9, 0, value),
+            REG_DISPSTAT_HI => self.write_dispstat_byte(NdsCpu::Arm9, 1, value),
             0x0400_00B0..=0x0400_00DF => self.arm9_dma.write(addr - IO_BASE, value),
             0x0400_0100..=0x0400_010F => self.arm9_timers.write(addr - IO_BASE, value),
             REG_IPCSYNC => self.write_ipcsync(NdsCpu::Arm9, value as u16),
@@ -859,7 +1008,7 @@ impl Arm7Bus for NdsBus {
 
 #[cfg(test)]
 mod tests {
-    use super::{NdsBus, REG_EXTKEYIN, REG_IPCFIFOCNT, REG_IPCFIFOSEND, REG_KEYINPUT};
+    use super::{NdsBus, REG_DISPSTAT, REG_EXTKEYIN, REG_IPCFIFOCNT, REG_IPCFIFOSEND, REG_KEYINPUT, REG_VCOUNT};
     use crate::cpu::arm7tdmi::{Arm7Bus, Arm7Tdmi};
     use crate::emulator::nds::NdsRomHeader;
     use crate::input::NdsKey;
@@ -1002,5 +1151,42 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bus.memory.main_ram[0x200..0x204].try_into().unwrap()), 0xAABB_CCDD);
         assert_ne!(bus.arm9_iflag & (crate::interrupts::gba::DMA0 as u32), 0);
         assert_eq!(bus.arm9_dma_active_count(), 0);
+    }
+
+    #[test]
+    fn nds_bus_video_timing_updates_dispstat_and_vcount() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+        let mut bus = NdsBus::new(rom, &header).expect("bus should initialize");
+
+        bus.tick_arm9(super::HBLANK_START_CYCLES);
+        assert_ne!(bus.read16(REG_DISPSTAT) & 0x0002, 0);
+
+        bus.tick_arm9(super::SCANLINE_CYCLES - super::HBLANK_START_CYCLES);
+        assert_eq!(bus.read16(REG_DISPSTAT) & 0x0002, 0);
+        assert_eq!(bus.read16(REG_VCOUNT), 1);
+    }
+
+    #[test]
+    fn nds_bus_video_vblank_and_vcounter_irq_reach_both_cpus() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+        let mut bus = NdsBus::new(rom, &header).expect("bus should initialize");
+
+        bus.write16(REG_DISPSTAT, 0x0020);
+        bus.write16(REG_DISPSTAT + 1, 1);
+        {
+            let mut arm9_bus = bus.arm9_view();
+            arm9_bus.write16(REG_DISPSTAT, 0x0028);
+            arm9_bus.write16(REG_DISPSTAT + 1, super::VISIBLE_SCANLINES as u16);
+        }
+
+        bus.tick_arm9(super::SCANLINE_CYCLES);
+        assert_ne!(bus.iflag & (crate::interrupts::gba::VCOUNTER as u32), 0);
+
+        bus.tick_arm9((super::VISIBLE_SCANLINES as u32 - 1) * super::SCANLINE_CYCLES);
+        assert_ne!(bus.arm9_iflag & (crate::interrupts::gba::VBLANK as u32), 0);
+        assert_ne!(bus.read_dispstat_value() & 0x0001, 0);
+        assert_ne!(bus.read_arm9_dispstat_value() & 0x0001, 0);
     }
 }

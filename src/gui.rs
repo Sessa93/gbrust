@@ -957,6 +957,12 @@ impl EmuApp {
             emu.bus.arm7_dma_active_count(),
             emu.bus.arm9_dma_active_count(),
         ));
+        ui.label(format!(
+            "VCOUNT={} ARM7 DISPSTAT=0x{:04X} ARM9 DISPSTAT=0x{:04X}",
+            emu.bus.video.vcount,
+            emu.bus.read_dispstat_value(),
+            emu.bus.read_arm9_dispstat_value(),
+        ));
 
         ui.separator();
         ui.label(RichText::new("ARM9").strong());
