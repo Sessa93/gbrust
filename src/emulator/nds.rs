@@ -17,6 +17,7 @@ const MAIN_BG_PALETTE_OFFSET: usize = 0x000;
 const MAIN_OBJ_PALETTE_OFFSET: usize = 0x200;
 const SUB_BG_PALETTE_OFFSET: usize = 0x400;
 const SUB_OBJ_PALETTE_OFFSET: usize = 0x600;
+const ENABLE_3D_BIT: u32 = 1 << 3;
 const BG_ENABLE_BITS: [u32; 4] = [1 << 8, 1 << 9, 1 << 10, 1 << 11];
 const OBJ_ENABLE_BIT: u32 = 1 << 12;
 const OBJ_1D_MAPPING_BIT: u32 = 1 << 4;
@@ -24,6 +25,7 @@ const OAM_SCREEN_BYTES: usize = 0x400;
 
 #[derive(Clone, Copy)]
 enum NdsBgKind {
+    ThreeD,
     Text,
     Affine,
     Bitmap8,
@@ -169,6 +171,7 @@ pub struct NdsEmulator {
     pub arm7: Arm7Tdmi,
     pub arm9: NdsArm9,
     pub bus: NdsBus,
+    pub main_3d_framebuffer: Vec<u16>,
     pub framebuffer: Vec<u32>,
     pub total_frames: u64,
 }
@@ -191,6 +194,7 @@ impl NdsEmulator {
             arm7,
             arm9,
             bus,
+            main_3d_framebuffer: vec![0; NDS_SCREEN_PIXELS],
             framebuffer: vec![0xFF11161C; NDS_WIDTH * NDS_HEIGHT],
             total_frames: 0,
         };
@@ -204,6 +208,7 @@ impl NdsEmulator {
         let sub_bg_vram = self.bus.mapped_sub_bg_vram();
         let main_obj_vram = self.bus.mapped_main_obj_vram();
         let sub_obj_vram = self.bus.mapped_sub_obj_vram();
+        let main_3d_framebuffer = self.main_3d_framebuffer.clone();
         let main_oam = self.bus.memory.oam[..OAM_SCREEN_BYTES].to_vec();
         let sub_oam = self.bus.memory.oam[OAM_SCREEN_BYTES..OAM_SCREEN_BYTES * 2].to_vec();
         let main_state = (
@@ -224,6 +229,7 @@ impl NdsEmulator {
             0,
             &main_bg_vram,
             MAIN_BG_PALETTE_OFFSET,
+            Some(&main_3d_framebuffer),
             main_state.0,
             main_state.1,
             main_state.2,
@@ -267,6 +273,7 @@ impl NdsEmulator {
             NDS_SCREEN_HEIGHT,
             &sub_bg_vram,
             SUB_BG_PALETTE_OFFSET,
+            None,
             sub_state.0,
             sub_state.1,
             sub_state.2,
@@ -356,6 +363,7 @@ impl NdsEmulator {
         screen_y: usize,
         vram: &[u8],
         palette_offset: usize,
+        main_3d_framebuffer: Option<&[u16]>,
         dispcnt: u32,
         bgcnt: [u16; 4],
         bghofs: [u16; 4],
@@ -373,7 +381,7 @@ impl NdsEmulator {
             return false;
         }
 
-        let active_layers = active_2d_bgs(dispcnt, bgcnt);
+        let active_layers = active_2d_bgs(dispcnt, bgcnt, main_3d_framebuffer.is_some());
         if active_layers.is_empty() {
             return false;
         }
@@ -397,6 +405,12 @@ impl NdsEmulator {
             for px in 0..NDS_WIDTH {
                 for layer in &active_layers {
                     let raw_color = match layer.kind {
+                        NdsBgKind::ThreeD => {
+                            let Some(main_3d_framebuffer) = main_3d_framebuffer else {
+                                continue;
+                            };
+                            sample_3d_pixel(main_3d_framebuffer, px, screen_line)
+                        }
                         NdsBgKind::Text => sample_text_bg_pixel(
                             vram,
                             palette,
@@ -628,10 +642,12 @@ impl NdsEmulator {
 
     pub fn video_warning(&self) -> Option<String> {
         let mut warnings = Vec::new();
-        if let Some(main) = describe_video_warning("Main", self.bus.ppu_main.dispcnt, self.bus.ppu_main.disp3dcnt) {
+        if let Some(main) = describe_video_warning("Main", true, self.bus.ppu_main.dispcnt, self.bus.ppu_main.disp3dcnt)
+        {
             warnings.push(main);
         }
-        if let Some(sub) = describe_video_warning("Sub", self.bus.ppu_sub.dispcnt, self.bus.ppu_sub.disp3dcnt) {
+        if let Some(sub) = describe_video_warning("Sub", false, self.bus.ppu_sub.dispcnt, self.bus.ppu_sub.disp3dcnt)
+        {
             warnings.push(sub);
         }
 
@@ -688,7 +704,7 @@ fn supports_2d_layer_render(dispcnt: u32) -> bool {
     display_mode <= 1 && bg_mode <= 5
 }
 
-fn describe_video_warning(name: &str, dispcnt: u32, disp3dcnt: u16) -> Option<String> {
+fn describe_video_warning(name: &str, main_engine: bool, dispcnt: u32, disp3dcnt: u16) -> Option<String> {
     let display_mode = (dispcnt >> 16) & 0x3;
     let bg_mode = dispcnt & 0x7;
     let mut reasons = Vec::new();
@@ -699,7 +715,9 @@ fn describe_video_warning(name: &str, dispcnt: u32, disp3dcnt: u16) -> Option<St
     if bg_mode > 5 {
         reasons.push(format!("BG mode {}", bg_mode));
     }
-    if disp3dcnt != 0 {
+    if main_engine && dispcnt & ENABLE_3D_BIT != 0 {
+        reasons.push("3D rasterizer".to_string());
+    } else if disp3dcnt != 0 {
         reasons.push("3D engine state".to_string());
     }
 
@@ -710,12 +728,13 @@ fn describe_video_warning(name: &str, dispcnt: u32, disp3dcnt: u16) -> Option<St
     }
 }
 
-fn active_2d_bgs(dispcnt: u32, bgcnt: [u16; 4]) -> Vec<NdsBgLayer> {
+fn active_2d_bgs(dispcnt: u32, bgcnt: [u16; 4], main_3d_framebuffer: bool) -> Vec<NdsBgLayer> {
     let mut active = Vec::new();
     let bg_mode = (dispcnt & 0x7) as u8;
+    let main_3d = main_3d_framebuffer && dispcnt & ENABLE_3D_BIT != 0;
     for bg in 0..4usize {
         let enabled = dispcnt & BG_ENABLE_BITS[bg] != 0;
-        let kind = bg_kind(bg_mode, bg, bgcnt[bg]);
+        let kind = bg_kind(bg_mode, bg, bgcnt[bg], main_3d);
         if enabled {
             if let Some(kind) = kind {
                 active.push(NdsBgLayer { bg, kind });
@@ -727,7 +746,11 @@ fn active_2d_bgs(dispcnt: u32, bgcnt: [u16; 4]) -> Vec<NdsBgLayer> {
     active
 }
 
-fn bg_kind(bg_mode: u8, bg: usize, bgcnt: u16) -> Option<NdsBgKind> {
+fn bg_kind(bg_mode: u8, bg: usize, bgcnt: u16, main_3d: bool) -> Option<NdsBgKind> {
+    if main_3d && bg == 0 {
+        return Some(NdsBgKind::ThreeD);
+    }
+
     match bg_mode {
         0 => Some(NdsBgKind::Text),
         1 => match bg {
@@ -758,6 +781,15 @@ fn bg_kind(bg_mode: u8, bg: usize, bgcnt: u16) -> Option<NdsBgKind> {
         },
         _ => None,
     }
+}
+
+fn sample_3d_pixel(main_3d_framebuffer: &[u16], px: usize, screen_line: usize) -> Option<u16> {
+    let pixel = *main_3d_framebuffer.get(screen_line * NDS_WIDTH + px)?;
+    if pixel & 0x8000 == 0 {
+        return None;
+    }
+
+    Some(pixel & 0x7FFF)
 }
 
 fn bitmap_or_affine_kind(bgcnt: u16) -> NdsBgKind {
@@ -1060,7 +1092,7 @@ fn sample_bitmap_bg_pixel(
 mod tests {
     use super::{
         apply_master_brightness, describe_video_warning, rgb555_to_argb, supports_2d_layer_render,
-        NdsEmulator, NdsRomHeader, BG_ENABLE_BITS, MAIN_BG_PALETTE_OFFSET,
+        NdsEmulator, NdsRomHeader, BG_ENABLE_BITS, ENABLE_3D_BIT, MAIN_BG_PALETTE_OFFSET,
         MAIN_OBJ_PALETTE_OFFSET, MAIN_SCREEN_VRAM_OFFSET, NDS_SCREEN_HEIGHT, NDS_WIDTH,
         OBJ_1D_MAPPING_BIT, OBJ_ENABLE_BIT, SUB_BG_PALETTE_OFFSET, SUB_OBJ_PALETTE_OFFSET,
         SUB_SCREEN_VRAM_OFFSET,
@@ -1302,6 +1334,19 @@ mod tests {
     }
 
     #[test]
+    fn nds_emulator_renders_main_bg0_3d_surface() {
+        let rom = build_test_rom();
+        let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
+
+        emu.bus.ppu_main.dispcnt = (1 << 16) | ENABLE_3D_BIT | BG_ENABLE_BITS[0];
+        emu.main_3d_framebuffer[0] = 0x8000 | 0x03E0;
+
+        emu.run_frame();
+
+        assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x03E0));
+    }
+
+    #[test]
     fn nds_emulator_renders_main_obj_sprites() {
         let rom = build_test_rom();
         let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
@@ -1349,6 +1394,7 @@ mod tests {
     fn nds_2d_renderer_rejects_unsupported_display_modes() {
         assert!(supports_2d_layer_render(BG_ENABLE_BITS[0]));
         assert!(supports_2d_layer_render((1 << 16) | BG_ENABLE_BITS[0]));
+        assert!(supports_2d_layer_render((1 << 16) | ENABLE_3D_BIT | BG_ENABLE_BITS[0]));
         assert!(supports_2d_layer_render((1 << 16) | 5 | BG_ENABLE_BITS[3]));
         assert!(!supports_2d_layer_render(2 << 16));
         assert!(!supports_2d_layer_render(6));
@@ -1356,9 +1402,10 @@ mod tests {
 
     #[test]
     fn nds_video_warning_reports_unsupported_modes() {
-        let warning = describe_video_warning("Main", (2 << 16) | 6, 1).expect("warning expected");
+        let warning =
+            describe_video_warning("Main", true, ENABLE_3D_BIT | (2 << 16) | 6, 0).expect("warning expected");
         assert!(warning.contains("display mode 2"));
         assert!(warning.contains("BG mode 6"));
-        assert!(warning.contains("3D engine state"));
+        assert!(warning.contains("3D rasterizer"));
     }
 }
