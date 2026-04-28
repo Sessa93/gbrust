@@ -18,6 +18,7 @@ const MAIN_OBJ_PALETTE_OFFSET: usize = 0x200;
 const SUB_BG_PALETTE_OFFSET: usize = 0x400;
 const SUB_OBJ_PALETTE_OFFSET: usize = 0x600;
 const ENABLE_3D_BIT: u32 = 1 << 3;
+const DISP3DCNT_CLEAR_BMP_BIT: u16 = 1 << 14;
 const BG_ENABLE_BITS: [u32; 4] = [1 << 8, 1 << 9, 1 << 10, 1 << 11];
 const OBJ_ENABLE_BIT: u32 = 1 << 12;
 const OBJ_1D_MAPPING_BIT: u32 = 1 << 4;
@@ -209,6 +210,12 @@ impl NdsEmulator {
         let main_obj_vram = self.bus.mapped_main_obj_vram();
         let sub_obj_vram = self.bus.mapped_sub_obj_vram();
         let main_3d_framebuffer = self.main_3d_framebuffer.clone();
+        let mut main_3d_surface = main_3d_framebuffer;
+        apply_3d_clear_plane(
+            &mut main_3d_surface,
+            self.bus.ppu_main.clear_color,
+            self.bus.ppu_main.disp3dcnt,
+        );
         let main_oam = self.bus.memory.oam[..OAM_SCREEN_BYTES].to_vec();
         let sub_oam = self.bus.memory.oam[OAM_SCREEN_BYTES..OAM_SCREEN_BYTES * 2].to_vec();
         let main_state = (
@@ -229,7 +236,7 @@ impl NdsEmulator {
             0,
             &main_bg_vram,
             MAIN_BG_PALETTE_OFFSET,
-            Some(&main_3d_framebuffer),
+            Some(&main_3d_surface),
             main_state.0,
             main_state.1,
             main_state.2,
@@ -1088,6 +1095,24 @@ fn sample_bitmap_bg_pixel(
     }
 }
 
+fn apply_3d_clear_plane(main_3d_framebuffer: &mut [u16], clear_color: u32, disp3dcnt: u16) {
+    if disp3dcnt & DISP3DCNT_CLEAR_BMP_BIT != 0 {
+        return;
+    }
+
+    let alpha = ((clear_color >> 16) & 0x1F) as u16;
+    if alpha == 0 {
+        return;
+    }
+
+    let fill = 0x8000 | (clear_color as u16 & 0x7FFF);
+    for pixel in main_3d_framebuffer.iter_mut() {
+        if *pixel & 0x8000 == 0 {
+            *pixel = fill;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1102,6 +1127,7 @@ mod tests {
     const REG_VRAMCNT_A: u32 = 0x0400_0240;
     const REG_VRAMCNT_C: u32 = 0x0400_0242;
     const REG_VRAMCNT_D: u32 = 0x0400_0243;
+    const REG_GFX_CLEAR_COLOR: u32 = 0x0400_0350;
 
     fn build_test_rom() -> Vec<u8> {
         let mut rom = vec![0u8; 0x400];
@@ -1344,6 +1370,22 @@ mod tests {
         emu.run_frame();
 
         assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x03E0));
+    }
+
+    #[test]
+    fn nds_emulator_renders_main_3d_clear_plane() {
+        let rom = build_test_rom();
+        let mut emu = NdsEmulator::new(rom).expect("test ROM should bootstrap");
+
+        emu.bus.ppu_main.dispcnt = (1 << 16) | ENABLE_3D_BIT | BG_ENABLE_BITS[0];
+        {
+            let mut arm9_bus = emu.bus.arm9_view();
+            arm9_bus.write32(REG_GFX_CLEAR_COLOR, (31 << 16) | 0x001F);
+        }
+
+        emu.run_frame();
+
+        assert_eq!(emu.framebuffer[0], rgb555_to_argb(0x001F));
     }
 
     #[test]

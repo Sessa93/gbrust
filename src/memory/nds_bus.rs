@@ -97,6 +97,9 @@ const REG_VRAMCNT_H: u32 = 0x0400_0248;
 const REG_VRAMCNT_I: u32 = 0x0400_0249;
 const REG_POSTFLG: u32 = 0x0400_0300;
 const REG_HALTCNT: u32 = 0x0400_0301;
+const REG_GFX_CLEAR_COLOR: u32 = 0x0400_0350;
+const REG_GFX_CLRIMAGE_OFFSET: u32 = 0x0400_0356;
+const REG_GFX_CLEAR_END: u32 = REG_GFX_CLRIMAGE_OFFSET + 1;
 const IPC_FIFO_CAPACITY: usize = 16;
 
 const SMALL_MAIN_BG_OFFSETS: [usize; 4] = [0x00000, 0x04000, 0x10000, 0x14000];
@@ -152,6 +155,9 @@ pub struct NdsPpuRegisters {
     pub bldy: u16,
     pub disp3dcnt: u16,
     pub dispcapcnt: u32,
+    pub clear_color: u32,
+    pub clear_depth: u16,
+    pub clear_image_offset: u16,
     pub master_bright: u16,
 }
 
@@ -178,6 +184,9 @@ impl NdsPpuRegisters {
             bldy: 0,
             disp3dcnt: 0,
             dispcapcnt: 0,
+            clear_color: 0,
+            clear_depth: 0,
+            clear_image_offset: 0,
             master_bright: 0,
         }
     }
@@ -221,6 +230,11 @@ impl NdsPpuRegisters {
             0x060 => self.disp3dcnt as u8,
             0x061 => (self.disp3dcnt >> 8) as u8,
             0x064..=0x067 => ((self.dispcapcnt >> ((offset - 0x064) * 8)) & 0xFF) as u8,
+            0x350..=0x353 => ((self.clear_color >> ((offset - 0x350) * 8)) & 0xFF) as u8,
+            0x354 => self.clear_depth as u8,
+            0x355 => (self.clear_depth >> 8) as u8,
+            0x356 => self.clear_image_offset as u8,
+            0x357 => (self.clear_image_offset >> 8) as u8,
             0x06C => self.master_bright as u8,
             0x06D => (self.master_bright >> 8) as u8,
             _ => 0,
@@ -278,6 +292,14 @@ impl NdsPpuRegisters {
                 let shift = (offset - 0x064) * 8;
                 self.dispcapcnt = (self.dispcapcnt & !(0xFF << shift)) | ((value as u32) << shift);
             }
+            0x350..=0x353 => {
+                let shift = (offset - 0x350) * 8;
+                self.clear_color = (self.clear_color & !(0xFF << shift)) | ((value as u32) << shift);
+            }
+            0x354 => self.clear_depth = (self.clear_depth & 0xFF00) | value as u16,
+            0x355 => self.clear_depth = (self.clear_depth & 0x00FF) | ((value as u16) << 8),
+            0x356 => self.clear_image_offset = (self.clear_image_offset & 0xFF00) | value as u16,
+            0x357 => self.clear_image_offset = (self.clear_image_offset & 0x00FF) | ((value as u16) << 8),
             0x06C => self.master_bright = (self.master_bright & 0xFF00) | value as u16,
             0x06D => self.master_bright = (self.master_bright & 0x00FF) | ((value as u16) << 8),
             _ => {}
@@ -608,6 +630,15 @@ impl NdsBus {
         }
     }
 
+    fn read_main_3d_byte(&self, addr: u32) -> Option<u8> {
+        match addr {
+            REG_GFX_CLEAR_COLOR..=REG_GFX_CLEAR_END => {
+                Some(self.ppu_main.read_byte(addr - PPU_MAIN_BASE))
+            }
+            _ => None,
+        }
+    }
+
     fn copy_bg_vram_window(&self, sub: bool) -> Vec<u8> {
         let mut window = vec![0; if sub { SUB_BG_VRAM_SIZE } else { MAIN_BG_VRAM_SIZE }];
         let bank_order: &[usize] = if sub {
@@ -680,6 +711,16 @@ impl NdsBus {
             }
             PPU_SUB_BASE..=PPU_SUB_END => {
                 self.ppu_sub.write_byte(addr - PPU_SUB_BASE, value);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn write_main_3d_byte(&mut self, addr: u32, value: u8) -> bool {
+        match addr {
+            REG_GFX_CLEAR_COLOR..=REG_GFX_CLEAR_END => {
+                self.ppu_main.write_byte(addr - PPU_MAIN_BASE, value);
                 true
             }
             _ => false,
@@ -1361,6 +1402,7 @@ impl NdsBus {
             REG_VCOUNT => self.video.vcount as u8,
             REG_VCOUNT_HI => (self.video.vcount >> 8) as u8,
             _ if Self::vramcnt_index(addr).is_some() => self.vramcnt[Self::vramcnt_index(addr).unwrap()],
+            _ if self.read_main_3d_byte(addr).is_some() => self.read_main_3d_byte(addr).unwrap_or(0),
             _ if self.read_ppu_byte(addr).is_some() => self.read_ppu_byte(addr).unwrap_or(0),
             0x0400_00B0..=0x0400_00DF => self.arm9_dma.read(addr - IO_BASE),
             0x0400_0100..=0x0400_010F => self.arm9_timers.read(addr - IO_BASE),
@@ -1436,6 +1478,7 @@ impl NdsBus {
             _ if Self::vramcnt_index(addr).is_some() => {
                 self.vramcnt[Self::vramcnt_index(addr).unwrap()] = value;
             }
+            _ if self.write_main_3d_byte(addr, value) => {}
             _ if self.write_ppu_byte(addr, value) => {}
             0x0400_00B0..=0x0400_00DF => self.arm9_dma.write(addr - IO_BASE, value),
             0x0400_0100..=0x0400_010F => self.arm9_timers.write(addr - IO_BASE, value),
@@ -1646,6 +1689,9 @@ mod tests {
     const REG_DMA0DAD: u32 = 0x0400_00B4;
     const REG_DMA0CNT_L: u32 = 0x0400_00B8;
     const REG_DMA0CNT_H: u32 = 0x0400_00BA;
+    const REG_GFX_CLEAR_COLOR: u32 = 0x0400_0350;
+    const REG_GFX_CLEAR_DEPTH: u32 = 0x0400_0354;
+    const REG_GFX_CLRIMAGE_OFFSET: u32 = 0x0400_0356;
     const REG_TM0CNT_L: u32 = 0x0400_0100;
     const REG_TM0CNT_H: u32 = 0x0400_0102;
 
@@ -1816,6 +1862,28 @@ mod tests {
         assert_eq!(bus.ppu_sub.dispcnt, 0x8877_6655);
         assert_eq!(bus.ppu_sub.bgcnt[0], 0x1234);
         assert_eq!(bus.ppu_sub.master_bright, 0x000F);
+    }
+
+    #[test]
+    fn nds_bus_main_3d_clear_registers_round_trip_via_arm9_view() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+        let mut bus = NdsBus::new(rom, &header).expect("bus should initialize");
+
+        {
+            let mut arm9_bus = bus.arm9_view();
+            arm9_bus.write32(REG_GFX_CLEAR_COLOR, 0x1F12_3456);
+            arm9_bus.write16(REG_GFX_CLEAR_DEPTH, 0x7FFF);
+            arm9_bus.write16(REG_GFX_CLRIMAGE_OFFSET, 0x00C0);
+
+            assert_eq!(arm9_bus.read32(REG_GFX_CLEAR_COLOR), 0x1F12_3456);
+            assert_eq!(arm9_bus.read16(REG_GFX_CLEAR_DEPTH), 0x7FFF);
+            assert_eq!(arm9_bus.read16(REG_GFX_CLRIMAGE_OFFSET), 0x00C0);
+        }
+
+        assert_eq!(bus.ppu_main.clear_color, 0x1F12_3456);
+        assert_eq!(bus.ppu_main.clear_depth, 0x7FFF);
+        assert_eq!(bus.ppu_main.clear_image_offset, 0x00C0);
     }
 
     #[test]
