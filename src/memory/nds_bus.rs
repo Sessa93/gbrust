@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::cpu::arm7tdmi::Arm7Bus;
 use crate::emulator::nds::NdsRomHeader;
 use crate::input::{NdsInput, NdsKey};
+use crate::timer::GbaTimers;
 
 const ARM7_BIOS_SIZE: usize = 0x4000;
 const ARM9_BIOS_SIZE: usize = 0x8000;
@@ -131,6 +132,8 @@ pub struct NdsBus {
     pub input: NdsInput,
     pub memory: NdsMemory,
     pub io: Vec<u8>,
+    pub timers: GbaTimers,
+    pub arm9_timers: GbaTimers,
     pub bios7: Vec<u8>,
     pub bios9: Vec<u8>,
     pub cartridge_rom: Vec<u8>,
@@ -159,6 +162,8 @@ impl NdsBus {
             input: NdsInput::new(),
             memory,
             io: vec![0; IO_SIZE],
+            timers: GbaTimers::new(),
+            arm9_timers: GbaTimers::new(),
             bios7: Self::generate_hle_bios7(),
             bios9: Self::generate_hle_bios9(),
             cartridge_rom: rom,
@@ -194,6 +199,8 @@ impl NdsBus {
     }
 
     pub fn tick(&mut self, cycles: u32) {
+        let (timer_irqs, _) = self.timers.tick(cycles);
+        self.iflag |= timer_irqs as u32;
         self.cycles += cycles as u64;
         if self.halt && self.check_irq() {
             self.halt = false;
@@ -201,6 +208,8 @@ impl NdsBus {
     }
 
     pub fn tick_arm9(&mut self, cycles: u32) {
+        let (timer_irqs, _) = self.arm9_timers.tick(cycles);
+        self.arm9_iflag |= timer_irqs as u32;
         self.arm9_cycles += cycles as u64;
         if self.arm9_halt && self.arm9_check_irq() {
             self.arm9_halt = false;
@@ -229,6 +238,7 @@ impl NdsBus {
 
     fn read_io_byte(&self, addr: u32) -> u8 {
         match addr {
+            0x0400_0100..=0x0400_010F => self.timers.read(addr - IO_BASE),
             REG_KEYINPUT => self.input.read_keyinput() as u8,
             REG_KEYINPUT_HI => (self.input.read_keyinput() >> 8) as u8,
             REG_EXTKEYIN => self.input.read_extkeyin() as u8,
@@ -254,6 +264,7 @@ impl NdsBus {
 
     fn read_arm9_io_byte(&self, addr: u32) -> u8 {
         match addr {
+            0x0400_0100..=0x0400_010F => self.arm9_timers.read(addr - IO_BASE),
             REG_IME => self.arm9_ime as u8,
             REG_IME_HI_1 | REG_IME_HI_2 | REG_IME_HI_3 => 0,
             REG_IE => self.arm9_ie as u8,
@@ -275,6 +286,7 @@ impl NdsBus {
 
     fn write_io_byte(&mut self, addr: u32, value: u8) {
         match addr {
+            0x0400_0100..=0x0400_010F => self.timers.write(addr - IO_BASE, value),
             REG_IME => self.ime = value & 0x01 != 0,
             REG_IE => self.ie = (self.ie & !0x0000_00FF) | value as u32,
             REG_IE_HI_1 => self.ie = (self.ie & !0x0000_FF00) | ((value as u32) << 8),
@@ -295,6 +307,7 @@ impl NdsBus {
 
     fn write_arm9_io_byte(&mut self, addr: u32, value: u8) {
         match addr {
+            0x0400_0100..=0x0400_010F => self.arm9_timers.write(addr - IO_BASE, value),
             REG_IME => self.arm9_ime = value & 0x01 != 0,
             REG_IE => self.arm9_ie = (self.arm9_ie & !0x0000_00FF) | value as u32,
             REG_IE_HI_1 => self.arm9_ie = (self.arm9_ie & !0x0000_FF00) | ((value as u32) << 8),
@@ -469,6 +482,9 @@ mod tests {
     use crate::emulator::nds::NdsRomHeader;
     use crate::input::NdsKey;
 
+    const REG_TM0CNT_L: u32 = 0x0400_0100;
+    const REG_TM0CNT_H: u32 = 0x0400_0102;
+
     fn build_test_rom() -> Vec<u8> {
         let mut rom = vec![0u8; 0x400];
         rom[0x000..0x00C].copy_from_slice(b"TEST CART   ");
@@ -520,5 +536,41 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(bus.read32(0x0380_0020), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn nds_bus_timer_irq_sets_arm7_interrupt_flags() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+        let mut bus = NdsBus::new(rom, &header).expect("bus should initialize");
+
+        bus.write32(super::REG_IE, 1 << 3);
+        bus.write32(super::REG_IME, 1);
+        bus.write16(REG_TM0CNT_L, 0xFFFE);
+        bus.write16(REG_TM0CNT_H, 0x00C0);
+        bus.tick(2);
+
+        assert_ne!(bus.iflag & (1 << 3), 0);
+        assert!(bus.check_irq());
+    }
+
+    #[test]
+    fn nds_bus_timer_irq_sets_arm9_interrupt_flags() {
+        let rom = build_test_rom();
+        let header = NdsRomHeader::parse(&rom).expect("test ROM header should parse");
+        let mut bus = NdsBus::new(rom, &header).expect("bus should initialize");
+
+        {
+            let mut arm9_bus = bus.arm9_view();
+            arm9_bus.write32(super::REG_IE, 1 << 3);
+            arm9_bus.write32(super::REG_IME, 1);
+            arm9_bus.write16(REG_TM0CNT_L, 0xFFFE);
+            arm9_bus.write16(REG_TM0CNT_H, 0x00C0);
+        }
+
+        bus.tick_arm9(2);
+
+        assert_ne!(bus.arm9_iflag & (1 << 3), 0);
+        assert!(bus.arm9_check_irq());
     }
 }
