@@ -1,22 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::cpu::arm7tdmi::{Arm7Tdmi, CpuMode};
-use crate::input::NdsInput;
+use crate::memory::nds_bus::NdsBus;
 use crate::{NDS_HEIGHT, NDS_WIDTH};
 
 const NDS_SCREEN_HEIGHT: usize = NDS_HEIGHT / 2;
 const NDS_HEADER_SIZE: usize = 0x170;
 const NDS_ARM9_CYCLES_PER_FRAME: u32 = 1_117_132;
 const NDS_ARM7_CYCLES_PER_FRAME: u32 = 558_566;
-const NDS_MAIN_RAM_BASE: u32 = 0x0200_0000;
-const NDS_MAIN_RAM_SIZE: usize = 4 * 1024 * 1024;
-const NDS_SHARED_WRAM_BASE: u32 = 0x0300_0000;
-const NDS_SHARED_WRAM_SIZE: usize = 32 * 1024;
-const NDS_ARM7_WRAM_BASE: u32 = 0x0380_0000;
-const NDS_ARM7_WRAM_SIZE: usize = 64 * 1024;
-const NDS_VRAM_SIZE: usize = 0x000A_4000;
-const NDS_PALETTE_SIZE: usize = 0x1000;
-const NDS_OAM_SIZE: usize = 0x1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NdsRomHeader {
@@ -142,103 +133,11 @@ impl NdsArm9 {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct NdsMemory {
-    pub main_ram: Vec<u8>,
-    pub shared_wram: Vec<u8>,
-    pub arm7_wram: Vec<u8>,
-    pub vram: Vec<u8>,
-    pub palette: Vec<u8>,
-    pub oam: Vec<u8>,
-}
-
-impl NdsMemory {
-    pub fn new() -> Self {
-        Self {
-            main_ram: vec![0; NDS_MAIN_RAM_SIZE],
-            shared_wram: vec![0; NDS_SHARED_WRAM_SIZE],
-            arm7_wram: vec![0; NDS_ARM7_WRAM_SIZE],
-            vram: vec![0; NDS_VRAM_SIZE],
-            palette: vec![0; NDS_PALETTE_SIZE],
-            oam: vec![0; NDS_OAM_SIZE],
-        }
-    }
-
-    pub fn load_program_sections(&mut self, rom: &[u8], header: &NdsRomHeader) -> Result<(), String> {
-        let arm9_start = header.arm9_rom_offset as usize;
-        let arm9_end = (header.arm9_rom_offset + header.arm9_size) as usize;
-        let arm7_start = header.arm7_rom_offset as usize;
-        let arm7_end = (header.arm7_rom_offset + header.arm7_size) as usize;
-
-        self.load_section("ARM9", header.arm9_ram_address, &rom[arm9_start..arm9_end])?;
-        self.load_section("ARM7", header.arm7_ram_address, &rom[arm7_start..arm7_end])?;
-
-        Ok(())
-    }
-
-    fn load_section(&mut self, name: &str, ram_address: u32, data: &[u8]) -> Result<(), String> {
-        if ram_address >= NDS_MAIN_RAM_BASE
-            && ram_address < NDS_MAIN_RAM_BASE + NDS_MAIN_RAM_SIZE as u32
-        {
-            return Self::copy_to_region(name, ram_address, data, NDS_MAIN_RAM_BASE, &mut self.main_ram);
-        }
-
-        if ram_address >= NDS_SHARED_WRAM_BASE
-            && ram_address < NDS_SHARED_WRAM_BASE + NDS_SHARED_WRAM_SIZE as u32
-        {
-            return Self::copy_to_region(
-                name,
-                ram_address,
-                data,
-                NDS_SHARED_WRAM_BASE,
-                &mut self.shared_wram,
-            );
-        }
-
-        if ram_address >= NDS_ARM7_WRAM_BASE
-            && ram_address < NDS_ARM7_WRAM_BASE + NDS_ARM7_WRAM_SIZE as u32
-        {
-            return Self::copy_to_region(name, ram_address, data, NDS_ARM7_WRAM_BASE, &mut self.arm7_wram);
-        }
-
-        Err(format!(
-            "{} RAM destination 0x{:08X} is outside the currently modelled NDS memory regions",
-            name,
-            ram_address
-        ))
-    }
-
-    fn copy_to_region(
-        name: &str,
-        ram_address: u32,
-        data: &[u8],
-        base_address: u32,
-        region: &mut [u8],
-    ) -> Result<(), String> {
-        let offset = (ram_address - base_address) as usize;
-        let end = offset + data.len();
-        if end > region.len() {
-            return Err(format!(
-                "{} program does not fit in region starting at 0x{:08X}: end offset 0x{:X}, region size 0x{:X}",
-                name,
-                base_address,
-                end,
-                region.len()
-            ));
-        }
-
-        region[offset..end].copy_from_slice(data);
-        Ok(())
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
 pub struct NdsEmulator {
-    pub rom: Vec<u8>,
     pub header: NdsRomHeader,
     pub arm7: Arm7Tdmi,
     pub arm9: NdsArm9,
-    pub input: NdsInput,
-    pub memory: NdsMemory,
+    pub bus: NdsBus,
     pub framebuffer: Vec<u32>,
     pub total_frames: u64,
 }
@@ -254,16 +153,13 @@ impl NdsEmulator {
         arm7.banked_regs[3][5] = 0x0380_FDC0;
 
         let arm9 = NdsArm9::new(header.arm9_entry_address);
-        let mut memory = NdsMemory::new();
-        memory.load_program_sections(&rom, &header)?;
+        let bus = NdsBus::new(rom, &header)?;
 
         let mut emu = Self {
-            rom,
             header,
             arm7,
             arm9,
-            input: NdsInput::new(),
-            memory,
+            bus,
             framebuffer: vec![0xFF11161C; NDS_WIDTH * NDS_HEIGHT],
             total_frames: 0,
         };
@@ -309,8 +205,23 @@ impl NdsEmulator {
     }
 
     pub fn run_frame(&mut self) -> &[u32] {
+        let mut arm7_cycles = 0;
+        while arm7_cycles < NDS_ARM7_CYCLES_PER_FRAME {
+            if self.bus.halt {
+                self.arm7.halted = true;
+                self.bus.halt = false;
+            }
+
+            if self.bus.check_irq() {
+                self.arm7.handle_irq();
+            }
+
+            let cycles = self.arm7.step(&mut self.bus);
+            self.bus.tick(cycles);
+            arm7_cycles += cycles;
+        }
+
         self.arm9.advance_placeholder(NDS_ARM9_CYCLES_PER_FRAME);
-        self.arm7.cycles += NDS_ARM7_CYCLES_PER_FRAME as u64;
         self.total_frames += 1;
         self.refresh_placeholder_framebuffer();
         &self.framebuffer
@@ -382,8 +293,8 @@ mod tests {
 
         assert_eq!(emu.arm9.regs[15], 0x0200_0000);
         assert_eq!(emu.arm7.regs[15], 0x0380_0000);
-        assert_eq!(&emu.memory.main_ram[..16], &rom[0x200..0x210]);
-        assert_eq!(&emu.memory.arm7_wram[..16], &rom[0x300..0x310]);
+        assert_eq!(&emu.bus.memory.main_ram[..16], &rom[0x200..0x210]);
+        assert_eq!(&emu.bus.memory.arm7_wram[..8], &rom[0x300..0x308]);
     }
 
     #[test]

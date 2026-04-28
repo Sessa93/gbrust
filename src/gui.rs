@@ -112,11 +112,7 @@ impl Emulator {
             }
             Self::Nds(emu) => {
                 Self::apply_key_map(input, &NDS_KEY_MAP, |key, pressed| {
-                    if pressed {
-                        emu.input.key_down(key);
-                    } else {
-                        emu.input.key_up(key);
-                    }
+                    emu.bus.set_key(key, pressed);
                 });
             }
             Self::None => {}
@@ -209,32 +205,32 @@ impl Emulator {
             (Self::Nds(emu), DebugMemoryRegion::NdsMainRam) => Some(MemoryRegionView {
                 label: region.label(),
                 base_address: 0x0200_0000,
-                bytes: &emu.memory.main_ram,
+                bytes: &emu.bus.memory.main_ram,
             }),
             (Self::Nds(emu), DebugMemoryRegion::NdsSharedWram) => Some(MemoryRegionView {
                 label: region.label(),
                 base_address: 0x0300_0000,
-                bytes: &emu.memory.shared_wram,
+                bytes: &emu.bus.memory.shared_wram,
             }),
             (Self::Nds(emu), DebugMemoryRegion::NdsArm7Wram) => Some(MemoryRegionView {
                 label: region.label(),
                 base_address: 0x0380_0000,
-                bytes: &emu.memory.arm7_wram,
+                bytes: &emu.bus.memory.arm7_wram,
             }),
             (Self::Nds(emu), DebugMemoryRegion::NdsVram) => Some(MemoryRegionView {
                 label: region.label(),
                 base_address: 0x0600_0000,
-                bytes: &emu.memory.vram,
+                bytes: &emu.bus.memory.vram,
             }),
             (Self::Nds(emu), DebugMemoryRegion::NdsPalette) => Some(MemoryRegionView {
                 label: region.label(),
                 base_address: 0x0500_0000,
-                bytes: &emu.memory.palette,
+                bytes: &emu.bus.memory.palette,
             }),
             (Self::Nds(emu), DebugMemoryRegion::NdsOam) => Some(MemoryRegionView {
                 label: region.label(),
                 base_address: 0x0700_0000,
-                bytes: &emu.memory.oam,
+                bytes: &emu.bus.memory.oam,
             }),
             _ => None,
         }
@@ -939,11 +935,20 @@ impl EmuApp {
         ));
         ui.label(format!(
             "KEYINPUT=0x{:04X} EXTKEYIN=0x{:04X} Touch=({}, {}) pressed={}",
-            emu.input.read_keyinput(),
-            emu.input.read_extkeyin(),
-            emu.input.touchscreen_x,
-            emu.input.touchscreen_y,
-            emu.input.touchscreen_pressed,
+            emu.bus.input.read_keyinput(),
+            emu.bus.input.read_extkeyin(),
+            emu.bus.input.touchscreen_x,
+            emu.bus.input.touchscreen_y,
+            emu.bus.input.touchscreen_pressed,
+        ));
+        ui.label(format!(
+            "IME={} IE=0x{:08X} IF=0x{:08X} POSTFLG=0x{:02X} HALT={} Bus cycles={}",
+            emu.bus.ime,
+            emu.bus.ie,
+            emu.bus.iflag,
+            emu.bus.postflg,
+            emu.bus.halt,
+            emu.bus.cycles,
         ));
 
         ui.separator();
